@@ -1,6 +1,12 @@
 {
 	"redirects": [
 		{
+			"source": "/",
+			"has": [{ "type": "host", "value": "h.dio.la" }],
+			"destination": "https://github.com/DaniGuardiola/home-network",
+			"permanent": false
+		},
+		{
 			"source": "/(.*)",
 			"has": [{ "type": "host", "value": "h.dio.la" }],
 			"destination": "https://raw.githubusercontent.com/DaniGuardiola/home-network/refs/heads/main/$1",
