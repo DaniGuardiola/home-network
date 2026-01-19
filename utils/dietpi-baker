@@ -1,0 +1,836 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# dietpi-baker
+# mounts a DietPi .img via loopback, replaces /boot/dietpi.txt or copies a config dir into /boot,
+# then cleanly unmounts.
+
+VERSION="1.0.0"
+
+# ------------- pretty output -------------
+if [[ -t 1 ]]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLU=$'\e[34m'; CYA=$'\e[36m'; RST=$'\e[0m'
+else
+  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; BLU=""; CYA=""; RST=""
+fi
+
+log()  { printf "%s
+" "${CYA}==>${RST} $*" >&2; }
+info() { printf "%s
+" "${BLU} i ${RST} $*" >&2; }
+ok()   { printf "%s
+" "${GRN} ok${RST} $*" >&2; }
+warn() { printf "%s
+" "${YLW}warn${RST} $*" >&2; }
+err()  { printf "%s\n" "${RED}err${RST} $*" >&2; }
+
+die() { err "$*"; exit 1; }
+
+banner() {
+  printf "%s\n" "${BOLD}"
+  cat <<'EOF'
+                                                                          
+▄▄▄▄▄▄                   ▄▄▄▄▄▄▄           ▄▄                             
+███▀▀██▄ ▀▀         ██   ███▀▀███▄ ▀▀      ██          ▄▄                 
+███  ███ ██  ▄█▀█▄ ▀██▀▀ ███▄▄███▀ ██      ████▄  ▀▀█▄ ██ ▄█▀ ▄█▀█▄ ████▄ 
+███  ███ ██  ██▄█▀  ██   ███▀▀▀▀   ██      ██ ██ ▄█▀██ ████   ██▄█▀ ██ ▀▀ 
+██████▀  ██▄ ▀█▄▄▄  ██   ███       ██▄     ████▀ ▀█▄██ ██ ▀█▄ ▀█▄▄▄ ██    
+                                                                          
+                                                                          
+EOF
+  printf "%s\n" "${RST}${DIM}v${VERSION}${RST}  "
+  printf "%s\n\n" "${DIM}bakes custom DietPi images with a pre-loaded dietpi.txt and more${RST}"
+}
+
+# ------------- utils -------------
+is_url() {
+  [[ "${1:-}" =~ ^https?:// ]]
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+need_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    die "run as root (use sudo)"
+  fi
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+mktemp_dir() {
+  mktemp -d 2>/dev/null || mktemp -d -t dietpi-baker
+}
+
+cleanup() {
+  set +e
+
+  if [[ -n "${CHROOT_MOUNTS_DONE:-}" ]]; then
+    umount -l "${MNT_ROOT}/dev" 2>/dev/null
+    umount -l "${MNT_ROOT}/proc" 2>/dev/null
+    umount -l "${MNT_ROOT}/sys" 2>/dev/null
+  fi
+
+  if [[ -n "${MNT_ROOT:-}" ]]; then
+    umount -l "$MNT_ROOT" 2>/dev/null
+  fi
+  if [[ -n "${MNT_BOOT:-}" ]]; then
+    umount -l "$MNT_BOOT" 2>/dev/null
+  fi
+  if [[ -n "${LOOPDEV:-}" ]]; then
+    losetup -d "$LOOPDEV" 2>/dev/null
+  fi
+
+  [[ -n "${WORKDIR:-}" ]] && rm -rf "$WORKDIR" 2>/dev/null
+}
+trap cleanup EXIT
+
+# progress-enabled downloader (optional deps)
+download_to() {
+  local url="$1" dest="$2"
+
+  if have_cmd curl; then
+    # -f fail, -L follow, --progress-bar pretty bar
+    curl -fL --progress-bar "$url" -o "$dest"
+    return
+  fi
+  if have_cmd wget; then
+    wget --progress=bar:force:noscroll -O "$dest" "$url"
+    return
+  fi
+  die "need curl or wget to download: $url"
+}
+
+# fetch a local path or url into a local file
+# prints resulting path
+fetch_file() {
+  local src="$1" dest_dir="$2"
+  local base
+
+  if is_url "$src"; then
+    base="$(basename "${src%%\?*}")"
+    [[ -n "$base" ]] || base="download"
+    local dest="$dest_dir/$base"
+    log "downloading: $src"
+    download_to "$src" "$dest"
+    printf "%s" "$dest"
+    return
+  fi
+
+  # local path
+  [[ -f "$src" ]] || die "file not found: $src"
+  printf "%s" "$src"
+}
+
+# fetch a local path or url into a local directory
+# - local can be dir or archive
+# - url must be archive
+# prints resulting dir path
+fetch_dir() {
+  local src="$1" dest_dir="$2"
+
+  if is_url "$src"; then
+    local archive
+    archive="$(fetch_file "$src" "$dest_dir")"
+    printf "%s" "$(extract_archive "$archive" "$dest_dir")"
+    return
+  fi
+
+  # local
+  if [[ -d "$src" ]]; then
+    printf "%s" "$src"
+    return
+  fi
+
+  if [[ -f "$src" ]]; then
+    printf "%s" "$(extract_archive "$src" "$dest_dir")"
+    return
+  fi
+
+  die "path not found: $src"
+}
+
+# extract archives into a new directory under dest_parent; returns the extracted dir
+extract_archive() {
+  local archive="$1" dest_parent="$2"
+  local out_dir
+  out_dir="$dest_parent/extracted-$(date +%s)"
+  mkdir -p "$out_dir"
+
+  local lower
+  lower="$(printf "%s" "$archive" | tr '[:upper:]' '[:lower:]')"
+
+  log "extracting archive: $(basename "$archive")"
+
+  if [[ "$lower" == *.zip ]]; then
+    have_cmd unzip || die "need unzip to extract .zip"
+    unzip -q "$archive" -d "$out_dir"
+    printf "%s" "$out_dir"
+    return
+  fi
+
+  # tar family
+  if [[ "$lower" == *.tar || "$lower" == *.tar.gz || "$lower" == *.tgz || "$lower" == *.tar.xz || "$lower" == *.txz || "$lower" == *.tar.bz2 || "$lower" == *.tbz2 ]]; then
+    have_cmd tar || die "need tar to extract tar archives"
+    tar -xf "$archive" -C "$out_dir"
+    printf "%s" "$out_dir"
+    return
+  fi
+
+  die "unsupported archive format: $archive"
+}
+
+# ------------- core operations -------------
+
+KNOWN_BOOT_FILES=(
+  "dietpi.txt"
+)
+
+mount_boot_only() {
+  local img="$1"
+
+  need_cmd losetup
+  need_cmd mount
+  need_cmd umount
+
+  log "attaching loop device"
+  LOOPDEV="$(losetup -f --show -P "$img")"
+  ok "loop device: $LOOPDEV"
+
+  local p1="${LOOPDEV}p1"
+  [[ -b "$p1" ]] || die "expected partition not found: $p1"
+
+  MNT_BOOT="$(mktemp_dir)"
+  log "mounting boot partition ($p1)"
+  mount "$p1" "$MNT_BOOT"
+  ok "mounted boot"
+}
+
+mount_img() {
+  local img="$1"
+
+  need_cmd losetup
+  need_cmd mount
+  need_cmd umount
+  need_cmd fdisk
+
+  log "inspecting partitions"
+  fdisk -l "$img" | sed -n '1,120p' || true
+
+  log "attaching loop device"
+  LOOPDEV="$(losetup -f --show -P "$img")"
+  ok "loop device: $LOOPDEV"
+
+  # heuristics: boot is p1, root is p2
+  local p1="${LOOPDEV}p1"
+  local p2="${LOOPDEV}p2"
+
+  [[ -b "$p1" ]] || die "expected partition not found: $p1"
+  [[ -b "$p2" ]] || die "expected partition not found: $p2"
+
+  MNT_ROOT="$(mktemp_dir)"
+  MNT_BOOT="$(mktemp_dir)"
+
+  log "mounting root partition ($p2)"
+  mount "$p2" "$MNT_ROOT"
+
+  log "mounting boot partition ($p1)"
+  mount "$p1" "$MNT_BOOT"
+
+  ok "mounted"
+}
+
+replace_dietpi_txt() {
+  local config_txt="$1"
+  local boot_dir="$2"
+
+  [[ -f "$config_txt" ]] || die "config file not found: $config_txt"
+
+  # dietpi uses /boot/dietpi.txt typically; some images may have case variants
+  local target="$boot_dir/dietpi.txt"
+  [[ -e "$target" ]] || warn "target file not found (will create): $target"
+
+  log "replacing $(basename "$target")"
+  install -m 0644 "$config_txt" "$target"
+  ok "updated: $target"
+}
+
+copy_config_dir_into_boot() {
+  local src_dir="$1"
+  local boot_dir="$2"
+
+  [[ -d "$src_dir" ]] || die "config dir not found: $src_dir"
+
+  log "copying config dir contents into /boot (overwrite same names)"
+
+  shopt -s dotglob
+
+  # some /boot partitions are FAT, which does not support unix ownership.
+  # preserving ownership can cause cp to exit non-zero under set -e.
+  if cp --help 2>/dev/null | grep -q -- '--no-preserve'; then
+    cp -a --no-preserve=ownership "$src_dir"/* "$boot_dir"/
+  else
+    # portable fallback: tar pipe without preserving ownership
+    have_cmd tar || die "need tar for archive fallback copy"
+    (cd "$src_dir" && tar -cf - .) | (cd "$boot_dir" && tar -xf - --no-same-owner)
+  fi
+
+  shopt -u dotglob
+
+  ok "copied to: $boot_dir"
+}
+
+sync_and_unmount() {
+  log "syncing"
+  sync
+  log "unmounting"
+  umount "$MNT_ROOT"
+  umount "$MNT_BOOT"
+  losetup -d "$LOOPDEV"
+  ok "done"
+
+  # prevent trap double-unmount
+  MNT_ROOT=""; MNT_BOOT=""; LOOPDEV=""
+}
+
+# ------------- inspect/extract subcommands -------------
+
+print_boot_tree() {
+  local base="$1"
+
+  if have_cmd tree; then
+    tree -L 5 "$base"
+  else
+    warn "tree not installed; using find"
+    need_cmd find
+    (cd "$base" && find . -maxdepth 5 -print | sed 's|^\./||' | sed '/^$/d')
+    if (cd "$base" && find . -mindepth 6 -print -quit | grep -q .); then
+      printf "%s
+" "[...] (more files deeper than 5 levels)"
+    fi
+  fi
+}
+
+inspect_known() {
+  local boot_dir="$1"
+  local f
+  for f in "${KNOWN_BOOT_FILES[@]}"; do
+    printf "%s
+" "--- $f ---"
+    if [[ -f "$boot_dir/$f" ]]; then
+      cat "$boot_dir/$f"
+    else
+      printf "%s
+" "(missing)"
+    fi
+    printf "%s
+" ""
+  done
+}
+
+inspect_show_file() {
+  local boot_dir="$1" rel="$2"
+  rel="${rel#/}"
+  local p="$boot_dir/$rel"
+
+  if [[ -f "$p" ]]; then
+    cat "$p"
+    return
+  fi
+  if [[ -d "$p" ]]; then
+    die "path is a directory, not a file: $rel"
+  fi
+  die "file not found: $rel"
+}
+
+resolve_out_path_for_file() {
+  local out="$1" rel="$2"
+  rel="${rel#/}"
+
+  if [[ -d "$out" ]]; then
+    printf "%s" "$out/$(basename "$rel")"
+    return
+  fi
+
+  local parent
+  parent="$(dirname "$out")"
+  [[ -d "$parent" ]] || die "output directory does not exist: $parent"
+  printf "%s" "$out"
+}
+
+extract_one_file_from_boot() {
+  local boot_dir="$1" rel="$2" out="$3"
+  rel="${rel#/}"
+
+  local src="$boot_dir/$rel"
+  [[ -f "$src" ]] || die "file not found: $rel"
+
+  local dest
+  dest="$(resolve_out_path_for_file "$out" "$rel")"
+
+  log "extracting: $rel"
+  install -D -m 0644 "$src" "$dest"
+  ok "wrote: $dest"
+  printf "%s" "$dest"
+}
+
+extract_known_files_from_boot() {
+  local boot_dir="$1" out_dir="$2"
+  mkdir -p "$out_dir"
+
+  local f
+  for f in "${KNOWN_BOOT_FILES[@]}"; do
+    if [[ -f "$boot_dir/$f" ]]; then
+      log "extracting: $f"
+      install -D -m 0644 "$boot_dir/$f" "$out_dir/$f"
+      ok "wrote: $out_dir/$f"
+    else
+      warn "missing: $f"
+    fi
+  done
+}
+
+open_in_editor() {
+  local file="$1"
+  local editor="${EDITOR:-}"
+
+  if [[ -z "$editor" ]]; then
+    if have_cmd nano; then editor="nano";
+    elif have_cmd vi; then editor="vi";
+    elif have_cmd vim; then editor="vim";
+    else die "no editor found (set EDITOR or install nano/vi)";
+    fi
+  fi
+
+  "$editor" "$file"
+}
+
+cmd_inspect() {
+  local img="${1:-}"; shift || true
+  [[ -n "$img" ]] || die "inspect requires an image path"
+
+  local do_list=0 do_known=0
+  local rel_path=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -l|--list) do_list=1; shift;;
+      -k|--known) do_known=1; shift;;
+      -h|--help) usage; exit 0;;
+      -*) die "unknown inspect option: $1";;
+      *)
+        if [[ -n "$rel_path" ]]; then die "too many args for inspect"; fi
+        rel_path="$1"; shift;;
+    esac
+  done
+
+  if [[ "$do_list" -eq 1 && "$do_known" -eq 1 ]]; then
+    die "choose only one: --list or --known"
+  fi
+  if [[ "$do_list" -eq 0 && "$do_known" -eq 0 && -z "$rel_path" ]]; then
+    die "inspect needs --list, --known, or a boot_rel_path"
+  fi
+
+  mount_boot_only "$img"
+
+  if [[ "$do_list" -eq 1 ]]; then
+    print_boot_tree "$MNT_BOOT"
+  elif [[ "$do_known" -eq 1 ]]; then
+    inspect_known "$MNT_BOOT"
+  else
+    inspect_show_file "$MNT_BOOT" "$rel_path"
+  fi
+}
+
+cmd_extract() {
+  local img="${1:-}"; shift || true
+  [[ -n "$img" ]] || die "extract requires an image path"
+
+  local out=""
+  local do_known=0
+  local do_edit=0
+  local rel_path=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output) out="${2:-}"; shift 2;;
+      -k|--known) do_known=1; shift;;
+      -e|--edit) do_edit=1; shift;;
+      -h|--help) usage; exit 0;;
+      -*) die "unknown extract option: $1";;
+      *)
+        if [[ -n "$rel_path" ]]; then die "too many args for extract"; fi
+        rel_path="$1"; shift;;
+    esac
+  done
+
+  [[ -n "$out" ]] || die "extract requires --output"
+
+  if [[ "$do_known" -eq 1 && -n "$rel_path" ]]; then
+    die "choose either --known OR a boot_rel_path"
+  fi
+  if [[ "$do_known" -eq 0 && -z "$rel_path" ]]; then
+    die "extract needs --known or a boot_rel_path"
+  fi
+  if [[ "$do_known" -eq 1 && "$do_edit" -eq 1 ]]; then
+    die "--edit is only valid when extracting a single file"
+  fi
+
+  mount_boot_only "$img"
+
+  if [[ "$do_known" -eq 1 ]]; then
+    [[ -d "$out" || ! -e "$out" ]] || die "--output must be a directory for --known"
+    extract_known_files_from_boot "$MNT_BOOT" "$out"
+    return
+  fi
+
+  local written
+  written="$(extract_one_file_from_boot "$MNT_BOOT" "$rel_path" "$out")"
+
+  if [[ "$do_edit" -eq 1 ]]; then
+    open_in_editor "$written"
+  fi
+}
+
+# ------------- cli -------------
+usage() {
+  cat <<EOF
+${BOLD}dietpi-baker${RST} v${VERSION}
+
+${BOLD}what this does${RST}
+  bake, inspect, or extract files from DietPi .img images.
+  it mounts the image via loopback, works only on the /boot partition,
+  and cleanly unmounts everything when done.
+
+${BOLD}common commands${RST}
+  bake an image (most common):
+    sudo dietpi-baker <img_or_url> --config <dietpi.txt|url> (--out <out>|--replace)
+    sudo dietpi-baker <img_or_url> --config-dir <dir|archive|url> (--out <out>|--replace)
+
+  inspect boot contents (read-only):
+    sudo dietpi-baker inspect <img> --list
+    sudo dietpi-baker inspect <img> --known
+    sudo dietpi-baker inspect <img> <boot_file_path>
+
+  extract files from boot (read-only):
+    sudo dietpi-baker extract <img> --output <out_dir> --known
+    sudo dietpi-baker extract <img> --output <out_dir_or_file> <boot_file_path> [--edit]
+
+${BOLD}positional arguments${RST}
+  img_or_url
+    local path or http(s) url to a DietPi .img file
+
+  boot_file_path
+    file path inside the /boot partition
+    relative to /boot (no leading slash)
+
+    examples:
+      dietpi.txt
+      config.txt
+      overlays/uart0.dtbo
+      cmdline.txt
+
+${BOLD}bake options${RST}
+  -c, --config <file|url>
+      dietpi.txt to place at /boot/dietpi.txt
+
+  -d, --config-dir <dir|archive|url>
+      directory or archive copied into /boot/
+
+  -o, --out <path>
+      output image path or directory
+      if a directory is given, the output name is:
+        <input>-baked-<timestamp>.img
+
+  -r, --replace
+      replace the input image in place (not allowed for url inputs)
+
+${BOLD}inspect options${RST}
+  -l, --list
+      list boot partition as a tree (depth 5)
+
+  -k, --known
+      print known bake-related files and their contents
+
+${BOLD}extract options${RST}
+
+  -o, --output <path>
+      output directory (for --known) or file/directory (single file)
+
+  -k, --known
+      extract known bake-related files
+
+  -e, --edit
+      open extracted file in \$EDITOR (single file only)
+
+${BOLD}examples${RST}
+  1) bake local image with a local dietpi.txt, write a new output image
+     sudo dietpi-baker DietPi_RPi-ARMv8-Bookworm.img --config ./dietpi.txt --out ./out/
+
+  2) bake local image by copying a whole config folder into /boot
+     # useful for config.txt, cmdline.txt, overlays/, wpa_supplicant.conf, etc
+     sudo dietpi-baker DietPi.img --config-dir ./boot-files/ --out ./out/
+
+  3) bake from urls (image + dietpi.txt), write a new output image
+     # note: --replace is not allowed with url inputs
+     sudo dietpi-baker https://example.com/DietPi.img --config https://example.com/dietpi.txt --out ./out/
+
+  4) bake using a config archive (zip/tar.*), local or url
+     sudo dietpi-baker DietPi.img --config-dir ./boot-files.zip --out ./out/
+     sudo dietpi-baker DietPi.img --config-dir https://example.com/boot-files.tgz --out ./out/
+
+  5) inspect /boot contents
+     # list files
+     sudo dietpi-baker inspect DietPi.img --list
+
+     # show the known bake-related files
+     sudo dietpi-baker inspect DietPi.img --known
+
+     # show a specific file
+     sudo dietpi-baker inspect DietPi.img cmdline.txt
+
+  6) extract files from /boot
+     # extract the known bake-related files into a folder
+     sudo dietpi-baker extract DietPi.img --output ./extracted/ --known
+
+     # extract one file to a folder (keeps the basename)
+     sudo dietpi-baker extract DietPi.img --output ./extracted/ cmdline.txt
+
+     # extract one file to an explicit path and open it in your editor
+     sudo dietpi-baker extract DietPi.img --output ./cmdline.txt cmdline.txt --edit
+
+${BOLD}misc${RST}
+  -h, --help
+      show this help
+EOF
+}
+
+CONFIG=""
+CONFIG_DIR=""
+OUT=""
+REPLACE=0
+IMG=""
+
+parse_args() {
+  local positional=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--config)
+        CONFIG="${2:-}"; shift 2;;
+      -d|--config-dir)
+        CONFIG_DIR="${2:-}"; shift 2;;
+      -o|--out)
+        OUT="${2:-}"; shift 2;;
+      -r|--replace)
+        REPLACE=1; shift;;
+      -h|--help)
+        usage; exit 0;;
+      --)
+        shift; break;;
+      -*)
+        die "unknown option: $1";;
+      *)
+        positional+=("$1"); shift;;
+    esac
+  done
+
+  # allow one optional positional argument (img)
+  if [[ ${#positional[@]} -gt 1 ]]; then
+    die "too many positional args. expected at most 1 (img_or_url). got: ${#positional[@]}"
+  fi
+  if [[ ${#positional[@]} -eq 1 ]]; then
+    IMG="${positional[0]}"
+  fi
+}
+
+validate_args() {
+  # one and only one of CONFIG or CONFIG_DIR
+  if [[ -n "$CONFIG" && -n "$CONFIG_DIR" ]]; then
+    die "choose only one: --config OR --config-dir (not both)"
+  fi
+
+  if [[ -z "$CONFIG" && -z "$CONFIG_DIR" ]]; then
+    err "no config option specified. you must pass --config or --config-dir"
+    
+    exit 2
+  fi
+
+  # one and only one of OUT or REPLACE
+  if [[ -n "$OUT" && "$REPLACE" -eq 1 ]]; then
+    die "choose only one: --out OR --replace (not both)"
+  fi
+  if [[ -z "$OUT" && "$REPLACE" -eq 0 ]]; then
+    die "invalid usage: you must pass exactly one of --out or --replace"
+  fi
+}
+
+main() {
+  # no args -> show help
+  if [[ "$#" -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+
+  # allow help without root
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+    esac
+  done
+
+
+  banner
+  need_root
+  need_cmd bash
+
+  case "${1:-}" in
+    inspect)
+      shift
+      cmd_inspect "$@"
+      return
+      ;;
+    extract)
+      shift
+      cmd_extract "$@"
+      return
+      ;;
+  esac
+
+  parse_args "$@"
+  validate_args
+
+  WORKDIR="$(mktemp_dir)"
+
+  # img handling (optional positional)
+  local input_is_url=0
+  local input_basename=""
+  local src_img_path=""
+
+  if [[ -z "$IMG" ]]; then
+    die "no input image provided"
+  fi
+
+  if is_url "$IMG"; then
+    input_is_url=1
+    input_basename="$(basename "${IMG%%\?*}")"
+    [[ -n "$input_basename" ]] || input_basename="dietpi.img"
+    src_img_path="$WORKDIR/$input_basename"
+    log "downloading image: $IMG"
+    download_to "$IMG" "$src_img_path"
+  else
+    [[ -f "$IMG" ]] || die "image not found: $IMG"
+    input_basename="$(basename "$IMG")"
+    src_img_path="$IMG"
+  fi
+
+  if [[ "$REPLACE" -eq 1 && "$input_is_url" -eq 1 ]]; then
+    die "--replace is invalid when input image is a url"
+  fi
+
+  local out_img_path=""
+  if [[ "$REPLACE" -eq 1 ]]; then
+    out_img_path="$src_img_path"
+  else
+    # --out can be either:
+    # - a directory (existing, or explicitly indicated with a trailing /)
+    # - a file path (parent directory must exist)
+
+    # if it ends with /, treat as a directory and create it if missing
+    if [[ "$OUT" == */ ]]; then
+      if [[ -e "$OUT" && ! -d "$OUT" ]]; then
+        die "--out ends with / but is not a directory: $OUT"
+      fi
+      mkdir -p "$OUT"
+    fi
+
+    if [[ -d "$OUT" || "$OUT" == */ ]]; then
+      local ts
+      ts="$(date +%Y%m%d-%H%M%S)"
+      local base_no_ext="$input_basename"
+      if [[ "$base_no_ext" == *.img ]]; then
+        base_no_ext="${base_no_ext%.img}"
+      fi
+      out_img_path="${OUT%/}/${base_no_ext}-baked-${ts}.img"
+    else
+      local parent
+      parent="$(dirname "$OUT")"
+      [[ -d "$parent" ]] || die "output directory does not exist: $parent"
+      out_img_path="$OUT"
+    fi
+  fi
+
+  if [[ "$REPLACE" -eq 0 ]]; then
+    log "creating output image"
+    info "src: $src_img_path"
+    info "out: $out_img_path"
+    if cp --help 2>/dev/null | grep -q -- '--reflink'; then
+      cp --reflink=auto -f "$src_img_path" "$out_img_path"
+    else
+      cp -f "$src_img_path" "$out_img_path"
+    fi
+  else
+    log "replacing in place"
+    info "img: $out_img_path"
+  fi
+
+  local img_path="$out_img_path"
+
+  # config handling
+  if [[ -n "$CONFIG" ]]; then
+    local cfg_file
+    cfg_file="$WORKDIR/dietpi.txt"
+
+    if is_url "$CONFIG"; then
+      # download only when needed
+      local fetched
+      fetched="$(fetch_file "$CONFIG" "$WORKDIR")"
+
+      # fetch_file already downloads into WORKDIR with the original basename.
+      # if that basename is dietpi.txt, fetched == cfg_file, so don't cp onto itself.
+      if [[ "$fetched" != "$cfg_file" ]]; then
+        cp -f "$fetched" "$cfg_file"
+      fi
+    else
+      [[ -f "$CONFIG" ]] || die "config file not found: $CONFIG"
+      cp -f "$CONFIG" "$cfg_file"
+    fi
+
+    mount_img "$img_path"
+    replace_dietpi_txt "$cfg_file" "$MNT_BOOT"
+    sync_and_unmount
+    ok "baked image: $img_path"
+    return
+  fi
+
+  if [[ -n "$CONFIG_DIR" ]]; then
+    local dir
+    dir="$(fetch_dir "$CONFIG_DIR" "$WORKDIR")"
+
+    mount_img "$img_path"
+
+    # if archive extracts to a single top-level directory, prefer that
+    if [[ -d "$dir" ]]; then
+      local entries
+      entries=("$dir"/*)
+      if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+        info "archive has a single top-level directory; using it"
+        dir="${entries[0]}"
+      fi
+    fi
+
+    copy_config_dir_into_boot "$dir" "$MNT_BOOT"
+    sync_and_unmount
+    ok "baked image: $img_path"
+    return
+  fi
+}
+
+main "$@"
