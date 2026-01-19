@@ -11,6 +11,12 @@
 			"has": [{ "type": "host", "value": "h.dio.la" }],
 			"destination": "https://raw.githubusercontent.com/DaniGuardiola/home-network/refs/heads/main/$1",
 			"permanent": false
+		},
+		{
+			"source": "/",
+			"has": [{ "type": "host", "value": "h-utils.dio.la" }],
+			"destination": "https://raw.githubusercontent.com/DaniGuardiola/home-network/refs/heads/main/scripts/install-utils",
+			"permanent": false
 		}
 	]
 }
