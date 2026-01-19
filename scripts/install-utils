@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# install-utils
+# downloads and installs utility scripts from the home-network repo (https://h.dio.la)
+# to /usr/local/bin.
+# maintains a manifest file to track installed scripts for clean uninstall.
+
+# install all utilities:
+# curl -fsSL h-utils.dio.la | sudo bash
+
+# uninstall all utilities:
+# curl -fsSL h-utils.dio.la | sudo bash -s -- -u
+
+# view help:
+# curl -fsSL h-utils.dio.la | sudo bash -s -- -h
+
+REPO_URL="https://github.com/DaniGuardiola/home-network.git"
+TARGET_DIR="/usr/local/bin"
+MANIFEST_FILE="${TARGET_DIR}/h-scripts-installed.txt"
+
+bold() { printf "\033[1m%s\033[0m\n" "$*"; }
+info() { printf "[info] %s\n" "$*"; }
+warn() { printf "[warn] %s\n" "$*" 1>&2; }
+err()  { printf "[error] %s\n" "$*" 1>&2; }
+
+usage() {
+	cat <<EOF
+usage: install-utils [options]
+
+installs scripts from the repo's 'utils' directory into ${TARGET_DIR}.
+
+actions (default is install with no args):
+	-h, --help        show this help and exit.
+	-u, --uninstall   uninstall previously installed utilities.
+
+behavior:
+	- install: copies the utilities into ${TARGET_DIR} which will make them globally available.
+	- uninstall: removes all previously installed utilities from the system.
+EOF
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || {
+		err "missing dependency: '$1'. please install it and retry."
+		exit 1
+	}
+}
+
+need_sudo() {
+	# returns 0 if sudo is needed, 1 otherwise
+	if [ -w "$(dirname "${TARGET_DIR}")" ] && { [ ! -e "${TARGET_DIR}" ] || [ -w "${TARGET_DIR}" ]; }; then
+		return 1
+	fi
+	return 0
+}
+
+with_priv() {
+	if need_sudo; then
+		if command -v sudo >/dev/null 2>&1; then
+			sudo "$@"
+		else
+			err "insufficient permissions to write to ${TARGET_DIR}. please re-run with sudo."
+			exit 1
+		fi
+	else
+		"$@"
+	fi
+}
+
+manifest_has_entry() {
+	[ -f "${MANIFEST_FILE}" ] && grep -Fxq "$1" "${MANIFEST_FILE}"
+}
+
+manifest_add_entry() {
+	# ensure manifest exists
+	if [ ! -f "${MANIFEST_FILE}" ]; then
+		with_priv touch "${MANIFEST_FILE}"
+	fi
+	if ! manifest_has_entry "$1"; then
+		with_priv sh -c 'echo "$1" >> "$2"' _ "$1" "${MANIFEST_FILE}"
+	fi
+}
+
+do_uninstall() {
+	if [ ! -e "${TARGET_DIR}" ]; then
+		info "nothing to remove: ${TARGET_DIR} does not exist."
+		return 0
+	fi
+	if [ -f "${MANIFEST_FILE}" ]; then
+		bold "removing installed files from manifest..."
+		while IFS= read -r entry; do
+			[ -n "$entry" ] || continue
+			path="${TARGET_DIR}/$entry"
+			if [ -e "$path" ]; then
+				with_priv rm -f "$path"
+				info "removed $entry"
+			fi
+		done < "${MANIFEST_FILE}"
+		bold "removing manifest file..."
+		with_priv rm -f "${MANIFEST_FILE}"
+		info "uninstall complete."
+	else
+		warn "manifest not found; nothing to do."
+	fi
+}
+
+do_install() {
+	require_cmd git
+
+	TMPDIR="$(mktemp -d /tmp/home-network.XXXXXX)"
+	cleanup() { rm -rf "${TMPDIR}"; }
+	trap cleanup EXIT
+
+	bold "cloning repository to ${TMPDIR}..."
+	git clone --depth 1 "${REPO_URL}" "${TMPDIR}" >/dev/null 2>&1 || {
+		err "failed to clone repository. ensure you have network access and try again."
+		exit 1
+	}
+
+	SRC_UTILS="${TMPDIR}/utils"
+	if [ ! -d "${SRC_UTILS}" ]; then
+		err "source utils directory not found at ${SRC_UTILS}."
+		exit 1
+	fi
+
+	bold "installing utils to ${TARGET_DIR}..."
+	with_priv mkdir -p "${TARGET_DIR}"
+	# copy files one by one to avoid touching unrelated content
+	for f in "${SRC_UTILS}"/*; do
+		[ -f "$f" ] || continue
+		base="$(basename "$f")"
+		if cp --help >/dev/null 2>&1 && cp -a /dev/null /dev/null 2>/dev/null; then
+			with_priv cp -a "$f" "${TARGET_DIR}/${base}"
+		else
+			with_priv cp -Rp "$f" "${TARGET_DIR}/${base}"
+		fi
+	done
+
+	# update manifest with newly installed filenames (no duplicates)
+	for f in "${SRC_UTILS}"/*; do
+		[ -f "$f" ] || continue
+		base="$(basename "$f")"
+		manifest_add_entry "$base"
+	done
+
+	info "installed utils to ${TARGET_DIR}."
+}
+
+main() {
+	if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+		usage
+		exit 0
+	fi
+
+	if [ "${1:-}" = "-u" ] || [ "${1:-}" = "--uninstall" ]; then
+		do_uninstall
+		exit 0
+	fi
+
+	do_install
+}
+
+main "$@"
+
