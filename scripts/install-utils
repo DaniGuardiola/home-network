@@ -7,13 +7,13 @@ set -euo pipefail
 # maintains a manifest file to track installed scripts for clean uninstall.
 
 # install all utilities:
-# curl -fsSL h-utils.dio.la | sudo bash
+# curl -fsSL h-utils.dio.la | bash
 
 # uninstall all utilities:
-# curl -fsSL h-utils.dio.la | sudo bash -s -- -u
+# curl -fsSL h-utils.dio.la | bash -s -- -u
 
 # view help:
-# curl -fsSL h-utils.dio.la | sudo bash -s -- -h
+# curl -fsSL h-utils.dio.la | bash -s -- -h
 
 REPO_URL="https://github.com/DaniGuardiola/home-network.git"
 TARGET_DIR="/usr/local/bin"
