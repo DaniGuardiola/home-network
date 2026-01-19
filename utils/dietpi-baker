@@ -5,6 +5,15 @@ set -Eeuo pipefail
 # mounts a DietPi .img via loopback, replaces /boot/dietpi.txt or copies a config dir into /boot,
 # then cleanly unmounts.
 
+# run once without installing:
+# curl -fsSL h.dio.la/utils/dietpi-baker | sudo bash -s -- [options]
+# for example: curl -fsSL h.dio.la/utils/dietpi-baker | sudo bash -s -- --help
+
+# install to /usr/local/bin:
+# sudo curl -fsSL h.dio.la/utils/dietpi-baker -o /usr/local/bin/dietpi-baker && sudo chmod +x /usr/local/bin/dietpi-baker
+# then run: sudo dietpi-baker [options]
+# to uninstall: sudo rm /usr/local/bin/dietpi-baker
+
 VERSION="1.0.0"
 
 # ------------- pretty output -------------
