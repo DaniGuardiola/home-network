@@ -28,7 +28,7 @@ usage() {
 	cat <<EOF
 usage: install-utils [options]
 
-installs scripts from the repo's 'utils' directory into ${TARGET_DIR}.
+installs scripts from the 'utils' directory of the https://h.dio.la repo into ${TARGET_DIR}.
 
 actions (default is install with no args):
 	-h, --help        show this help and exit.
