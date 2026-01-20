@@ -1,0 +1,2638 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# dietpi-txt-wizard
+# interactive wizard to generate dietpi.txt configuration files for DietPi automation
+
+# run once without installing:
+# curl -fsSL h.dio.la/utils/dietpi-txt-wizard | bash -s -- [options]
+# for example: curl -fsSL h.dio.la/utils/dietpi-txt-wizard | bash
+
+# install to /usr/local/bin:
+# sudo curl -fsSL h.dio.la/utils/dietpi-txt-wizard -o /usr/local/bin/dietpi-txt-wizard && sudo chmod +x /usr/local/bin/dietpi-txt-wizard
+# then run: dietpi-txt-wizard [options]
+# to uninstall: rm /usr/local/bin/dietpi-txt-wizard
+
+VERSION="1.0.0"
+
+# ------------- pretty output -------------
+if [[ -t 1 ]]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLU=$'\e[34m'; CYA=$'\e[36m'; MGT=$'\e[35m'; RST=$'\e[0m'
+else
+  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; BLU=""; CYA=""; MGT=""; RST=""
+fi
+
+log()  { printf "%s\n" "${CYA}==>${RST} $*" >&2; }
+ok()   { printf "%s\n" "${GRN} ok${RST} $*" >&2; }
+info() { printf "%s\n" "${BLU}info${RST} $*" >&2; }
+warn() { printf "%s\n" "${YLW}warn${RST} $*" >&2; }
+err()  { printf "%s\n" "${RED}err${RST} $*" >&2; }
+
+# Debug logging to file
+DEBUG_LOG="/tmp/dietpi-wizard-debug.log"
+debug() { printf "[%s] %s\n" "$(date '+%H:%M:%S')" "$*" >> "$DEBUG_LOG"; }
+
+die() { err "$*"; exit 1; }
+
+banner() {
+  printf "%s\n" "${BOLD}"
+  cat <<'EOF'
+                                                                                                 
+▄▄▄▄▄▄                   ▄▄▄▄▄▄▄                                                              ▄▄ 
+███▀▀██▄ ▀▀         ██   ███▀▀███▄ ▀▀     ██          ██             ▀▀                       ██ 
+███  ███ ██  ▄█▀█▄ ▀██▀▀ ███▄▄███▀ ██    ▀██▀▀ ██ ██ ▀██▀▀   ██   ██ ██  ▀▀▀██  ▀▀█▄ ████▄ ▄████ 
+███  ███ ██  ██▄█▀  ██   ███▀▀▀▀   ██     ██    ███   ██     ██ █ ██ ██    ▄█▀ ▄█▀██ ██ ▀▀ ██ ██ 
+██████▀  ██▄ ▀█▄▄▄  ██   ███       ██▄ ██ ██   ██ ██  ██      ██▀██  ██▄ ▄██▄▄ ▀█▄██ ██    ▀████ 
+                                                                                                 
+                                                                                                 
+EOF
+  printf "%s\n" "${RST}${DIM}v${VERSION}${RST}"
+  printf "%s\n\n" "${DIM}interactive wizard for creating dietpi.txt configuration files${RST}"
+}
+
+# ------------- utils -------------
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+cleanup() {
+  set +e
+  [[ -n "${WORKDIR:-}" ]] && rm -rf "$WORKDIR" 2>/dev/null
+}
+trap cleanup EXIT
+
+mktemp_dir() {
+  mktemp -d 2>/dev/null || mktemp -d -t dietpi-txt-wizard
+}
+
+# detect if we can use whiptail/dialog
+USE_DIALOG=0
+DIALOG_CMD=""
+ABORT_CONFIRMED=0
+
+init_dialog() {
+  if have_cmd whiptail; then
+    USE_DIALOG=1
+    DIALOG_CMD="whiptail"
+  elif have_cmd dialog; then
+    USE_DIALOG=1
+    DIALOG_CMD="dialog"
+  fi
+}
+
+# confirm abort - ask user if they want to exit
+confirm_abort() {
+  debug "confirm_abort() called"
+  if [[ $ABORT_CONFIRMED -eq 1 ]]; then
+    debug "  Already confirmed, returning 0"
+    return 0  # already confirmed
+  fi
+  
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    local exit_code
+    debug "  Showing yesno dialog"
+    $DIALOG_CMD --title "abort wizard?" --yes-button "exit" --no-button "continue" --yesno "are you sure you want to exit the wizard?\n\nall entered values will be lost and no configuration file will be created." 12 70 </dev/tty >/dev/tty 2>&1
+    exit_code=$?
+    debug "  Dialog exit code: $exit_code (0=yes/exit, 1=no/continue)"
+    if [[ $exit_code -eq 0 ]]; then
+      ABORT_CONFIRMED=1
+      debug "  Returning 0 (confirmed exit)"
+      return 0
+    else
+      debug "  Returning 1 (continue)"
+      return 1
+    fi
+  else
+    printf "\n%s\n" "${BOLD}${RED}abort wizard?${RST}"
+    printf "%s\n" "are you sure you want to exit?"
+    printf "%s\n" "all entered values will be lost and no configuration file will be created."
+    while true; do
+      read -rp "exit? [y/N]: " answer
+      case "${answer,,}" in
+        y|yes)
+          ABORT_CONFIRMED=1
+          debug "  Terminal: confirmed exit"
+          return 0;;
+        n|no|"")
+          debug "  Terminal: continue"
+          return 1;;
+        *)
+          printf "please answer yes or no.\n";;
+      esac
+    done
+  fi
+}
+
+# check if user aborted - call this after command substitutions
+check_abort() {
+  local result="$1"
+  if [[ "$result" == "__ABORT__" ]] || [[ $ABORT_CONFIRMED -eq 1 ]]; then
+    warn "wizard aborted by user"
+    exit 0
+  fi
+}
+
+# ------------- dialog wrappers -------------
+
+# msgbox: show a message
+# usage: msgbox "Title" "Message"
+msgbox() {
+  local title="$1" msg="$2"
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    if ! $DIALOG_CMD --title "$title" --cancel-button "abort" --msgbox "$msg" 20 70; then
+      if confirm_abort; then
+        ABORT_CONFIRMED=1
+        warn "wizard aborted by user"
+        exit 0
+      else
+        msgbox "$title" "$msg"  # retry
+        return
+      fi
+    fi
+  else
+    printf "\n%s\n" "${BOLD}$title${RST}"
+    printf "%s\n\n" "$msg"
+    read -rp "Press Enter to continue..." || true
+  fi
+}
+
+# yesno: ask yes/no question
+# usage: yesno "Title" "Question" && ... || ...
+# returns 0 for yes, 1 for no
+yesno() {
+  local title="$1" msg="$2" default="${3:-yes}"
+  local dialog_default_flag=""
+  [[ "$default" == "no" ]] && dialog_default_flag="--defaultno"
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    local result
+    $DIALOG_CMD --title "$title" --cancel-button "abort" $dialog_default_flag --yesno "$msg" 20 70
+    result=$?
+    if [[ $result -eq 1 ]]; then
+      return 1  # user selected no
+    elif [[ $result -ne 0 ]]; then
+      # cancel/ESC pressed
+      if confirm_abort; then
+        ABORT_CONFIRMED=1
+        warn "wizard aborted by user"
+        exit 0
+      else
+        yesno "$title" "$msg" "$default"  # retry
+        return $?
+      fi
+    fi
+    return 0  # user selected yes
+  else
+    printf "\n%s\n" "${BOLD}$title${RST}"
+    printf "%s\n" "$msg"
+    local prompt="[Y/n]"
+    [[ "$default" == "no" ]] && prompt="[y/N]"
+    while true; do
+      read -rp "Continue? $prompt: " answer
+      case "${answer,,}" in
+        y|yes) return 0;;
+        n|no) return 1;;
+        "") [[ "$default" == "yes" ]] && return 0 || return 1;;
+        *) printf "Please answer yes or no.\n";;
+      esac
+    done
+  fi
+}
+
+# inputbox: get user input
+# usage: result=$(inputbox "Title" "Prompt" "default value")
+inputbox() {
+  local title="$1" msg="$2" default="$3"
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    local result exit_code
+    result=$($DIALOG_CMD --title "$title" --cancel-button "abort" --inputbox "$msg" 20 70 "$default" 3>&1 1>&2 2>&3)
+    exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+      # cancel/ESC pressed
+      if confirm_abort; then
+        ABORT_CONFIRMED=1
+        printf "__ABORT__"
+        return 1
+      else
+        result=$(inputbox "$title" "$msg" "$default")  # retry
+      fi
+    fi
+    printf "%s" "$result"
+  else
+    printf "\n%s\n" "${BOLD}$title${RST}"
+    printf "%s\n" "$msg"
+    read -rp "Value [$default]: " -e -i "$default" result
+    printf "%s" "$result"
+  fi
+}
+
+# inputbox_required: get user input, require non-empty value
+# usage: result=$(inputbox_required "Title" "Prompt" "default value")
+# will keep prompting until a non-empty value is provided
+inputbox_required() {
+  local title="$1" msg="$2" default="$3"
+  local result=""
+  local first_attempt=1
+  local exit_code
+  
+  while [[ -z "$result" ]]; do
+    if [[ $first_attempt -eq 0 ]]; then
+      # Add required message for subsequent attempts
+      if [[ "$USE_DIALOG" -eq 1 ]]; then
+        # Dialog mode: no ANSI codes, plain text
+        local required_msg="a value is required. please enter one.\n\n$msg"
+        result=$($DIALOG_CMD --title "$title" --cancel-button "abort" --inputbox "$required_msg" 20 70 "$default" 3>&1 1>&2 2>&3)
+        exit_code=$?
+      else
+        # Terminal mode: use colors
+        printf "\n%s\n" "${BOLD}$title${RST}"
+        printf "%s\n" "${RED}${BOLD}a value is required. please enter one.${RST}"
+        printf "%s\n" "$msg"
+        read -rp "Value [$default]: " -e -i "$default" result
+        exit_code=0
+      fi
+    else
+      # First attempt, no error message
+      if [[ "$USE_DIALOG" -eq 1 ]]; then
+        result=$($DIALOG_CMD --title "$title" --cancel-button "abort" --inputbox "$msg" 20 70 "$default" 3>&1 1>&2 2>&3)
+        exit_code=$?
+      else
+        printf "\n%s\n" "${BOLD}$title${RST}"
+        printf "%s\n" "$msg"
+        read -rp "Value [$default]: " -e -i "$default" result
+        exit_code=0
+      fi
+      first_attempt=0
+    fi
+    
+    # Check for cancel/abort
+    if [[ $exit_code -ne 0 ]]; then
+      if confirm_abort; then
+        ABORT_CONFIRMED=1
+        printf "__ABORT__"
+        return 1
+      else
+        result=""  # reset and retry
+        first_attempt=1
+      fi
+    fi
+  done
+  
+  printf "%s" "$result"
+}
+
+# menu: show a menu with single selection
+# usage: result=$(menu "Title" "Prompt" "tag1" "desc1" "tag2" "desc2" ...)
+menu() {
+  local title="$1" msg="$2"
+  shift 2
+  debug "menu() called with title='$title', arg count=$#"
+  
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    local result exit_code
+    debug "  Using dialog command: $DIALOG_CMD"
+    result=$($DIALOG_CMD --title "$title" --cancel-button "abort" --menu "$msg" 20 70 10 "$@" 3>&1 1>&2 2>&3)
+    exit_code=$?
+    debug "  Dialog exit code: $exit_code, result='$result'"
+    if [[ $exit_code -ne 0 ]]; then
+      debug "  Cancel pressed (exit_code=$exit_code)"
+      # cancel/ESC pressed
+      if confirm_abort; then
+        debug "  User confirmed abort"
+        ABORT_CONFIRMED=1
+        printf "__ABORT__"
+        return 1
+      else
+        debug "  User selected continue, retrying menu"
+        result=$(menu "$title" "$msg" "$@")  # retry
+      fi
+    fi
+    # filter out any error messages or empty results
+    [[ -z "$result" || "$result" == *"unknown"* ]] && return 1
+    debug "  Returning result: '$result'"
+    printf "%s" "$result"
+  else
+    printf "\n%s\n" "${BOLD}$title${RST}"
+    printf "%s\n\n" "$msg"
+    
+    local -a tags=()
+    local -a descs=()
+    while [[ $# -gt 0 ]]; do
+      tags+=("$1")
+      descs+=("$2")
+      shift 2
+    done
+    
+    for i in "${!tags[@]}"; do
+      printf "  %s) %s\n" "$((i+1))" "${descs[$i]}"
+    done
+    
+    while true; do
+      printf "\n"
+      read -rp "Select (1-${#tags[@]}): " choice
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#tags[@]}" ]]; then
+        printf "%s" "${tags[$((choice-1))]}"
+        return
+      fi
+      printf "Invalid choice. Please select 1-${#tags[@]}.\n"
+    done
+  fi
+}
+
+# checklist: show a checklist with multiple selections
+# usage: result=$(checklist "Title" "Prompt" "tag1" "desc1" "on/off" "tag2" "desc2" "on/off" ...)
+# returns space-separated list of selected tags
+checklist() {
+  local title="$1" msg="$2"
+  shift 2
+  
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    local result exit_code
+    local tmpfile=$(mktemp_dir)/checklist.$$
+    # Redirect whiptail's output to tmpfile, but let it use terminal for UI
+    $DIALOG_CMD --title "$title" --cancel-button "abort" --separate-output --checklist "$msg" 20 70 10 "$@" 2>"$tmpfile" </dev/tty >/dev/tty
+    exit_code=$?
+    result=$(cat "$tmpfile" 2>/dev/null)
+    rm -f "$tmpfile"
+    if [[ $exit_code -ne 0 ]]; then
+      # cancel/ESC pressed
+      if confirm_abort; then
+        ABORT_CONFIRMED=1
+        printf "__ABORT__"
+        return 1
+      else
+        result=$(checklist "$title" "$msg" "$@")  # retry
+      fi
+    fi
+    printf "%s" "$result"
+  else
+    printf "\n%s\n" "${BOLD}$title${RST}"
+    printf "%s\n\n" "$msg"
+    
+    local -a tags=()
+    local -a descs=()
+    local -a states=()
+    while [[ $# -gt 0 ]]; do
+      tags+=("$1")
+      descs+=("$2")
+      states+=("$3")
+      shift 3
+    done
+    
+    for i in "${!tags[@]}"; do
+      local mark="[ ]"
+      [[ "${states[$i]}" == "on" ]] && mark="[X]"
+      printf "  %s) %s %s\n" "$((i+1))" "$mark" "${descs[$i]}"
+    done
+    
+    printf "\n"
+    read -rp "Select items (space-separated, e.g. '1 3 4'): " choices
+    
+    local -a selected=()
+    for choice in $choices; do
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#tags[@]}" ]]; then
+        selected+=("${tags[$((choice-1))]}")
+      fi
+    done
+    
+    printf "%s" "${selected[*]}"
+  fi
+}
+
+# ------------- validation -------------
+
+validate_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]
+}
+
+validate_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 ]] && [[ "$port" -le 65535 ]]
+}
+
+# ------------- configuration variables -------------
+
+# These will hold the user's choices
+declare -A CONFIG
+SELECTED_CATEGORIES=""
+
+# Initialize with defaults
+init_config() {
+  # Network
+  CONFIG[NET_ETHERNET_ENABLED]=1
+  CONFIG[NET_WIFI_ENABLED]=0
+  CONFIG[NET_WIFI_COUNTRY_CODE]="GB"
+  CONFIG[NET_USESTATIC]=0
+  CONFIG[NET_STATIC_IP]="192.168.0.100"
+  CONFIG[NET_STATIC_MASK]="255.255.255.0"
+  CONFIG[NET_STATIC_GATEWAY]="192.168.0.1"
+  CONFIG[NET_STATIC_DNS]="9.9.9.9 149.112.112.112"
+  CONFIG[NET_DHCP_TO_STATIC]=0
+  CONFIG[NET_HOSTNAME]="DietPi"
+  CONFIG[NET_ETH_FORCE_SPEED]=0
+  CONFIG[BOOT_WAIT_FOR_NETWORK]=1
+  CONFIG[PROXY_ENABLED]=0
+  CONFIG[PROXY_ADDRESS]="MyProxyServer.com"
+  CONFIG[PROXY_PORT]=8080
+  CONFIG[PROXY_USERNAME]=""
+  CONFIG[PROXY_PASSWORD]=""
+  
+  # Localization
+  CONFIG[LOCALE]="C.UTF-8"
+  CONFIG[KEYBOARD_LAYOUT]="gb"
+  CONFIG[TIMEZONE]="UTC"
+  
+  # System
+  CONFIG[GLOBAL_PASSWORD]="dietpi"
+  CONFIG[SWAPFILE_SIZE]=1
+  CONFIG[SWAPFILE_LOCATION]="/var/swap"
+  CONFIG[HEADLESS]=0
+  CONFIG[SERIAL_CONSOLE_ENABLE]=1
+  CONFIG[UNMASK_LOGIND]=0
+  
+  # SSH & Security
+  CONFIG[SSH_SERVER_INDEX]=-1
+  CONFIG[SSH_DISABLE_PASSWORD_LOGINS]=0
+  CONFIG[SSH_PUBKEY]=""
+  
+  # Software
+  CONFIG[AUTOMATED]=0
+  CONFIG[INSTALL_SOFTWARE_ID]=""
+  CONFIG[APT_INSTALLS]=""
+  CONFIG[LOGGING_INDEX]=-1
+  CONFIG[RAMLOG_MAXSIZE]=50
+  CONFIG[WEB_SERVER_INDEX]=0
+  CONFIG[DESKTOP_INDEX]=0
+  CONFIG[BROWSER_INDEX]=-1
+  CONFIG[AUTOSTART_TARGET_INDEX]=0
+  CONFIG[AUTOSTART_LOGIN_USER]="root"
+  
+  # Scripts & Backup
+  CONFIG[CUSTOM_SCRIPT_EXEC]=0
+  CONFIG[BACKUP_RESTORE]=0
+  
+  # Advanced
+  CONFIG[SURVEY_OPTED_IN]=-1
+  CONFIG[CPU_GOVERNOR]="schedutil"
+  CONFIG[CPU_MAX_FREQ]="Disabled"
+  CONFIG[CPU_MIN_FREQ]="Disabled"
+  CONFIG[CHECK_DIETPI_UPDATES]=1
+  CONFIG[CHECK_APT_UPDATES]=1
+  CONFIG[NTP_MODE]=2
+  CONFIG[NTP_MIRROR]="default"
+  CONFIG[ENABLE_IPV6]=1
+  CONFIG[APT_DEBIAN_MIRROR]="https://deb.debian.org/debian"
+  CONFIG[DEV_GITBRANCH]="master"
+  CONFIG[DEV_GITOWNER]="MichaIng"
+  
+  # DietPi-Config settings (CPU/GPU/Connection)
+  CONFIG[CPU_ONDEMAND_SAMPLE_RATE]=25000
+  CONFIG[CPU_ONDEMAND_SAMPLE_DOWNFACTOR]=40
+  CONFIG[CPU_USAGE_THROTTLE_UP]=50
+  CONFIG[CPU_DISABLE_TURBO]=0
+  CONFIG[GPU_DRIVER]="none"
+  CONFIG[G_CHECK_URL_TIMEOUT]=10
+  CONFIG[G_CHECK_URL_ATTEMPTS]=2
+  CONFIG[CHECK_CONNECTION_IP]="9.9.9.9"
+  CONFIG[CHECK_CONNECTION_IPV6]="2620:fe::fe"
+  CONFIG[CHECK_DNS_DOMAIN]="dietpi.com"
+  CONFIG[SOUNDCARD]="none"
+  CONFIG[LCDPANEL]="none"
+  CONFIG[APT_RASPBIAN_MIRROR]="http://raspbian.raspberrypi.com/raspbian"
+  
+  # DietPi-Software settings (optional features)
+  CONFIG[SOFTWARE_WIREGUARD_MODE]="Server"
+  CONFIG[SOFTWARE_WIREGUARD_PORT]=51820
+  CONFIG[SOFTWARE_VNCSERVER_WIDTH]=1280
+  CONFIG[SOFTWARE_VNCSERVER_HEIGHT]=720
+  CONFIG[SOFTWARE_VNCSERVER_DEPTH]=16
+  CONFIG[SOFTWARE_VNCSERVER_DISPLAY_INDEX]=1
+  CONFIG[SOFTWARE_VNCSERVER_SHARE_DESKTOP]=0
+  CONFIG[SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME]="admin"
+  CONFIG[SOFTWARE_OWNCLOUD_DATADIR]="/mnt/dietpi_userdata/owncloud_data"
+  CONFIG[SOFTWARE_NEXTCLOUD_DATADIR]="/mnt/dietpi_userdata/nextcloud_data"
+  CONFIG[SOFTWARE_SYNAPSE_USERNAME]="dietpi"
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_SSID]="DietPi-HotSpot"
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_KEY]="dietpihotspot"
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_CHANNEL]=3
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI4]=0
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI5]=0
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI6]=0
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_5G]=0
+  CONFIG[SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL]=36
+  CONFIG[SOFTWARE_XORG_DPI]=96
+  CONFIG[SOFTWARE_CHROMIUM_RES_X]=1280
+  CONFIG[SOFTWARE_CHROMIUM_RES_Y]=720
+  CONFIG[SOFTWARE_CHROMIUM_AUTOSTART_URL]="https://dietpi.com/"
+  CONFIG[SOFTWARE_HOMEASSISTANT_APT_DEPS]=""
+  CONFIG[SOFTWARE_HOMEASSISTANT_PIP_DEPS]=""
+  CONFIG[SOFTWARE_K3S_EXEC]=""
+  CONFIG[SOFTWARE_DIETPI_DASHBOARD_VERSION]="Stable"
+  CONFIG[SOFTWARE_DIETPI_DASHBOARD_BACKEND]=0
+  CONFIG[SOFTWARE_URBACKUP_BACKUPPATH]="/mnt/dietpi_userdata/urbackup"
+  CONFIG[SOFTWARE_ROONSERVER_EARLYACCESS]=0
+}
+
+category_selected() {
+  local category="$1"
+  [[ " $SELECTED_CATEGORIES " =~ [[:space:]]$category[[:space:]] ]]
+}
+
+# ------------- wizard sections -------------
+
+wizard_intro() {
+  msgbox "welcome!" \
+"this wizard will help you create a dietpi.txt configuration file for DietPi automation.
+
+you'll be asked to configure various aspects of your DietPi system:
+  • network settings
+  • localization (locale, keyboard, timezone)
+  • system options (passwords, swap, etc.)
+  • SSH and security settings
+  • software to install automatically
+  • advanced system settings
+
+the wizard will only ask questions for the categories you select.
+
+for more information about DietPi automation, visit:
+https://dietpi.com/docs/usage/#how-to-do-an-automatic-base-installation-at-first-boot-dietpi-automation"
+}
+
+wizard_select_categories() {
+  local selected
+  selected=$(checklist "configuration categories" \
+"select which categories you want to configure.
+unselected categories will use default values." \
+    "network" "network configuration" "off" \
+    "localization" "localization & regional settings" "off" \
+    "system" "system options" "off" \
+    "ssh" "SSH & security" "off" \
+    "software" "software installation" "off" \
+    "advanced" "advanced settings" "off")
+  
+  printf "%s" "$selected"
+}
+
+# ------------- network configuration -------------
+
+wizard_network() {
+  log "configuring network..."
+  
+  # ethernet or WiFi
+  local net_type
+  net_type=$(menu "network type" \
+"how will this system connect to the network?" \
+    "ethernet" "ethernet (wired connection)" \
+    "wifi" "WiFi (wireless connection)" \
+    "both" "both (WiFi takes priority)")
+  check_abort "$net_type"
+  
+  case "$net_type" in
+    ethernet)
+      CONFIG[NET_ETHERNET_ENABLED]=1
+      CONFIG[NET_WIFI_ENABLED]=0
+      ;;
+    wifi)
+      CONFIG[NET_ETHERNET_ENABLED]=0
+      CONFIG[NET_WIFI_ENABLED]=1
+      wizard_wifi_settings
+      ;;
+    both)
+      CONFIG[NET_ETHERNET_ENABLED]=1
+      CONFIG[NET_WIFI_ENABLED]=1
+      wizard_wifi_settings
+      ;;
+  esac
+  
+  # static or DHCP
+  local ip_type
+  ip_type=$(menu "IP address configuration" \
+"how should the network be configured?" \
+    "dhcp" "DHCP (automatic IP address)" \
+    "static" "static IP address" \
+    "dhcp_to_static" "DHCP then convert to static")
+  check_abort "$ip_type"
+  
+  case "$ip_type" in
+    static)
+      CONFIG[NET_USESTATIC]=1
+      wizard_static_ip
+      ;;
+    dhcp_to_static)
+      CONFIG[NET_USESTATIC]=0
+      CONFIG[NET_DHCP_TO_STATIC]=1
+      ;;
+    dhcp)
+      CONFIG[NET_USESTATIC]=0
+      CONFIG[NET_DHCP_TO_STATIC]=0
+      ;;
+  esac
+  
+  # hostname
+  local hostname
+  hostname=$(inputbox_required "hostname" "enter the hostname for this system:" "${CONFIG[NET_HOSTNAME]:-dietpi}")
+  check_abort "$hostname"
+  CONFIG[NET_HOSTNAME]="$hostname"
+  
+  # wait for network at boot
+  if yesno "boot behavior" \
+"wait for network connection before starting services at boot?
+
+this ensures network-dependent services don't fail to start.
+recommended: yes"; then
+    CONFIG[BOOT_WAIT_FOR_NETWORK]=1
+  else
+    CONFIG[BOOT_WAIT_FOR_NETWORK]=0
+  fi
+
+  # ethernet speed
+  if yesno "ethernet speed" \
+"force a specific ethernet link speed?
+
+useful for flaky gigabit links; 0 keeps auto-negotiation." "no"; then
+    local eth_speed
+    eth_speed=$(inputbox_required "ethernet speed (Mbit/s)" \
+"enter speed in Mbit/s (0=auto, 10, 100, 1000, etc.)" "${CONFIG[NET_ETH_FORCE_SPEED]}")
+    check_abort "$eth_speed"
+    CONFIG[NET_ETH_FORCE_SPEED]="$eth_speed"
+  else
+    CONFIG[NET_ETH_FORCE_SPEED]=0
+  fi
+  
+  # proxy settings
+  if yesno "proxy server" \
+"do you need to configure a proxy server?
+
+only needed if your network requires a proxy for internet access." "no"; then
+    CONFIG[PROXY_ENABLED]=1
+    wizard_proxy_settings
+  else
+    CONFIG[PROXY_ENABLED]=0
+  fi
+}
+
+wizard_wifi_settings() {
+  msgbox "WiFi configuration" \
+"WiFi credentials are configured in dietpi-wifi.txt, not dietpi.txt.
+
+this wizard will only set the WiFi country code in dietpi.txt.
+you'll need to edit dietpi-wifi.txt separately to add your SSID and password."
+  
+  local country_code
+  country_code=$(inputbox_required "WiFi country code" \
+"enter your 2-letter country code (ISO 3166-1 alpha-2):
+
+examples: US, GB, DE, FR, JP, AU, CA
+
+this is required for proper WiFi regulation compliance." \
+    "${CONFIG[NET_WIFI_COUNTRY_CODE]}")
+  check_abort "$country_code"
+  
+  CONFIG[NET_WIFI_COUNTRY_CODE]="$country_code"
+}
+
+wizard_static_ip() {
+  local ip mask gateway dns
+  
+  ip=$(inputbox_required "static IP address" "enter the static IP address:" "${CONFIG[NET_STATIC_IP]}")
+  check_abort "$ip"
+  CONFIG[NET_STATIC_IP]="$ip"
+  
+  mask=$(inputbox_required "subnet mask" "enter the subnet mask:" "${CONFIG[NET_STATIC_MASK]}")
+  check_abort "$mask"
+  CONFIG[NET_STATIC_MASK]="$mask"
+  
+  gateway=$(inputbox_required "gateway" "enter the gateway IP address:" "${CONFIG[NET_STATIC_GATEWAY]}")
+  check_abort "$gateway"
+  CONFIG[NET_STATIC_GATEWAY]="$gateway"
+  
+  dns=$(inputbox_required "DNS servers" \
+"enter DNS server IP addresses (space-separated):" "${CONFIG[NET_STATIC_DNS]}")
+  check_abort "$dns"
+  CONFIG[NET_STATIC_DNS]="$dns"
+}
+
+wizard_proxy_settings() {
+  local addr port user pass
+  
+  addr=$(inputbox_required "proxy address" "enter the proxy server address:" "${CONFIG[PROXY_ADDRESS]}")
+  check_abort "$addr"
+  CONFIG[PROXY_ADDRESS]="$addr"
+  
+  port=$(inputbox_required "proxy port" "enter the proxy server port:" "${CONFIG[PROXY_PORT]}")
+  check_abort "$port"
+  CONFIG[PROXY_PORT]="$port"
+  
+  if yesno "proxy authentication" "does the proxy require authentication?" "no"; then
+    user=$(inputbox "proxy username" "enter the proxy username (or leave blank):" "${CONFIG[PROXY_USERNAME]}")
+    check_abort "$user"
+    CONFIG[PROXY_USERNAME]="$user"
+    
+    pass=$(inputbox "proxy password" "enter the proxy password (or leave blank):" "${CONFIG[PROXY_PASSWORD]}")
+    check_abort "$pass"
+    CONFIG[PROXY_PASSWORD]="$pass"
+  fi
+}
+# ------------- localization -------------
+
+wizard_localization() {
+  log "configuring localization..."
+  
+  # locale
+  local locale
+  locale=$(menu "locale" \
+"select your locale (language and character encoding):" \
+    "C.UTF-8" "C.UTF-8 (default, minimal)" \
+    "en_US.UTF-8" "English (United States)" \
+    "en_GB.UTF-8" "English (United Kingdom)" \
+    "de_DE.UTF-8" "German (Germany)" \
+    "fr_FR.UTF-8" "French (France)" \
+    "es_ES.UTF-8" "Spanish (Spain)" \
+    "it_IT.UTF-8" "Italian (Italy)" \
+    "ja_JP.UTF-8" "Japanese (Japan)" \
+    "zh_CN.UTF-8" "Chinese (China)" \
+    "custom" "enter custom locale")
+  check_abort "$locale"
+  
+  if [[ "$locale" == "custom" ]]; then
+    locale=$(inputbox_required "custom locale" \
+"enter your locale (must be UTF-8):" "${CONFIG[LOCALE]}")
+    check_abort "$locale"
+  fi
+  CONFIG[LOCALE]="$locale"
+  # keyboard layout
+  local kb_layout
+  kb_layout=$(menu "keyboard layout" \
+"select your keyboard layout:" \
+    "gb" "GB (United Kingdom, default)" \
+    "us" "US (United States)" \
+    "de" "DE (Germany)" \
+    "fr" "FR (France)" \
+    "es" "ES (Spain)" \
+    "it" "IT (Italy)" \
+    "jp" "JP (Japan)" \
+    "custom" "enter custom layout")
+  check_abort "$kb_layout"
+  
+  if [[ "$kb_layout" == "custom" ]]; then
+    kb_layout=$(inputbox_required "custom keyboard layout" \
+"enter your keyboard layout code:" "${CONFIG[KEYBOARD_LAYOUT]}")
+    check_abort "$kb_layout"
+  fi
+  CONFIG[KEYBOARD_LAYOUT]="$kb_layout"
+  
+  # timezone
+  local tz_region
+  tz_region=$(menu "timezone region" \
+"select your timezone region:" \
+    "UTC" "UTC (Coordinated Universal Time)" \
+    "America" "America" \
+    "Europe" "Europe" \
+    "Asia" "Asia" \
+    "Africa" "Africa" \
+    "Australia" "Australia" \
+    "Pacific" "Pacific" \
+    "custom" "enter custom timezone")
+  check_abort "$tz_region"
+  
+  if [[ "$tz_region" == "UTC" ]]; then
+    CONFIG[TIMEZONE]="UTC"
+  elif [[ "$tz_region" == "custom" ]]; then
+    local tz
+    tz=$(inputbox_required "custom timezone" \
+"enter your timezone (e.g. America/New_York, Europe/London):
+
+full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones" \
+      "${CONFIG[TIMEZONE]}")
+    check_abort "$tz"
+    CONFIG[TIMEZONE]="$tz"
+  else
+    # Show common cities for the region
+    wizard_timezone_city "$tz_region"
+  fi
+}
+
+wizard_timezone_city() {
+  local region="$1"
+  local city
+  
+  case "$region" in
+    America)
+      city=$(menu "America timezone" "select a city:" \
+        "America/New_York" "New York (EST/EDT)" \
+        "America/Chicago" "Chicago (CST/CDT)" \
+        "America/Denver" "Denver (MST/MDT)" \
+        "America/Los_Angeles" "Los Angeles (PST/PDT)" \
+        "America/Toronto" "Toronto" \
+        "America/Mexico_City" "Mexico City" \
+        "America/Sao_Paulo" "São Paulo" \
+        "custom" "enter custom")
+      check_abort "$city"
+      ;;
+    Europe)
+      city=$(menu "Europe timezone" "select a city:" \
+        "Europe/London" "London (GMT/BST)" \
+        "Europe/Paris" "Paris (CET/CEST)" \
+        "Europe/Berlin" "Berlin (CET/CEST)" \
+        "Europe/Rome" "Rome (CET/CEST)" \
+        "Europe/Madrid" "Madrid (CET/CEST)" \
+        "Europe/Amsterdam" "Amsterdam (CET/CEST)" \
+        "Europe/Moscow" "Moscow (MSK)" \
+        "custom" "enter custom")
+      check_abort "$city"
+      ;;
+    Asia)
+      city=$(menu "Asia timezone" "select a city:" \
+        "Asia/Tokyo" "Tokyo (JST)" \
+        "Asia/Shanghai" "Shanghai (CST)" \
+        "Asia/Hong_Kong" "Hong Kong (HKT)" \
+        "Asia/Singapore" "Singapore (SGT)" \
+        "Asia/Dubai" "Dubai (GST)" \
+        "Asia/Kolkata" "Kolkata (IST)" \
+        "Asia/Seoul" "Seoul (KST)" \
+        "custom" "enter custom")
+      check_abort "$city"
+      ;;
+    Australia)
+      city=$(menu "Australia timezone" "select a city:" \
+        "Australia/Sydney" "Sydney (AEST/AEDT)" \
+        "Australia/Melbourne" "Melbourne (AEST/AEDT)" \
+        "Australia/Brisbane" "Brisbane (AEST)" \
+        "Australia/Perth" "Perth (AWST)" \
+        "Australia/Adelaide" "Adelaide (ACST/ACDT)" \
+        "custom" "enter custom")
+      check_abort "$city"
+      ;;
+    *)
+      city="custom"
+      ;;
+  esac
+  
+  if [[ "$city" == "custom" ]]; then
+    city=$(inputbox_required "custom timezone" \
+"enter the full timezone (e.g. $region/City):" "${CONFIG[TIMEZONE]}")
+    check_abort "$city"
+  fi
+  
+  CONFIG[TIMEZONE]="$city"
+}
+
+# ------------- system options -------------
+
+wizard_system() {
+  log "configuring system options..."
+  
+  # global password
+  msgbox "global password" \
+"the global password is used for:
+  • root and dietpi user login
+  • default password for installed software
+
+IMPORTANT: change this from the default 'dietpi' for security!
+
+after first boot, the password is encrypted and removed from dietpi.txt."
+  
+  local password
+  password=$(inputbox_required "global password" \
+"enter the global password (or press enter for default 'dietpi'):" "${CONFIG[GLOBAL_PASSWORD]:-dietpi}")
+  check_abort "$password"
+  CONFIG[GLOBAL_PASSWORD]="$password"
+  
+  # swap configuration
+  local swap_size
+  swap_size=$(menu "swap space" \
+"configure swap space size:" \
+    "1" "auto (recommended)" \
+    "0" "disabled (no swap)" \
+    "512" "512 MiB" \
+    "1024" "1 GiB" \
+    "2048" "2 GiB" \
+    "4096" "4 GiB" \
+    "custom" "custom size")
+  check_abort "$swap_size"
+  
+  if [[ "$swap_size" == "custom" ]]; then
+    swap_size=$(inputbox_required "custom swap size" \
+"enter swap size in MiB (0 to disable):" "${CONFIG[SWAPFILE_SIZE]:-1}")
+    check_abort "$swap_size"
+  fi
+  [[ -n "$swap_size" ]] && CONFIG[SWAPFILE_SIZE]="$swap_size"
+  
+  # swap location (if enabled)
+  if [[ "${CONFIG[SWAPFILE_SIZE]}" != "0" ]]; then
+    local swap_loc
+    swap_loc=$(menu "swap location" \
+"where should swap space be located?" \
+      "/var/swap" "file on disk (default)" \
+      "zram" "zRAM (compressed RAM)")
+    check_abort "$swap_loc"
+    [[ -n "$swap_loc" ]] && CONFIG[SWAPFILE_LOCATION]="$swap_loc"
+  fi
+  
+  # headless mode (RPi only)
+  if yesno "headless mode" \
+"disable HDMI/video output to reduce power consumption and memory usage?
+
+this is only effective on Raspberry Pi.
+choose yes if this will be a headless server." "no"; then
+    CONFIG[HEADLESS]=1
+  else
+    CONFIG[HEADLESS]=0
+  fi
+  
+  # serial console
+  if yesno "serial console" \
+"enable serial console?
+
+disable if you don't need serial port access.
+you can enable it later via dietpi-config if needed."; then
+    CONFIG[SERIAL_CONSOLE_ENABLE]=1
+  else
+    CONFIG[SERIAL_CONSOLE_ENABLE]=0
+  fi
+  
+  # systemd-logind
+  if yesno "systemd-logind" \
+"unmask (enable) systemd-logind service?
+
+this is required by some desktop environments and GUI applications.
+leave disabled for headless servers." "no"; then
+    CONFIG[UNMASK_LOGIND]=1
+  else
+    CONFIG[UNMASK_LOGIND]=0
+  fi
+
+  # custom script execution
+  if yesno "custom automation script" \
+"run Automation_Custom_Script.sh or a remote script after installs?
+
+0 disables; set to 1 for local boot script or provide a URL to fetch and run." "no"; then
+    local custom_exec
+    custom_exec=$(inputbox_required "custom script" \
+"enter 0 (disable), 1 (run /boot/Automation_Custom_Script.sh), or URL" "${CONFIG[CUSTOM_SCRIPT_EXEC]}")
+    check_abort "$custom_exec"
+    CONFIG[CUSTOM_SCRIPT_EXEC]="$custom_exec"
+  else
+    CONFIG[CUSTOM_SCRIPT_EXEC]=0
+  fi
+
+  # backup restore
+  if yesno "restore DietPi-Backup" \
+"automatically restore a DietPi-Backup on first boot?
+
+0=disable, 1=interactive, 2=non-interactive restore of first backup found." "no"; then
+    local backup_restore
+    backup_restore=$(menu "backup restore mode" \
+"choose restore behavior" \
+      "1" "interactive restore (choose backup)" \
+      "2" "non-interactive (restore first found)" \
+      "0" "disable")
+    check_abort "$backup_restore"
+    CONFIG[BACKUP_RESTORE]="$backup_restore"
+  else
+    CONFIG[BACKUP_RESTORE]=0
+  fi
+}
+
+# ------------- SSH & security -------------
+
+wizard_ssh() {
+  log "configuring SSH & security..."
+  
+  # SSH server choice
+  local ssh_server
+  ssh_server=$(menu "SSH server" \
+"which SSH server should be installed?" \
+    "dropbear" "Dropbear (lightweight, default)" \
+    "openssh" "OpenSSH (full-featured)" \
+    "none" "none (disable SSH)")
+  check_abort "$ssh_server"
+  
+  case "$ssh_server" in
+    dropbear) CONFIG[SSH_SERVER_INDEX]=-1;;
+    openssh) CONFIG[SSH_SERVER_INDEX]=-2;;
+    none) CONFIG[SSH_SERVER_INDEX]=0;;
+  esac
+  
+  if [[ "$ssh_server" != "0" ]]; then
+    # SSH password logins
+    local ssh_pwd
+    ssh_pwd=$(menu "SSH password authentication" \
+"allow password authentication for SSH?" \
+      "allow" "allow password logins (default)" \
+      "root" "disable for root user only" \
+      "disable" "disable for all users (pubkey only)")
+    check_abort "$ssh_pwd"
+    
+    case "$ssh_pwd" in
+      allow) CONFIG[SSH_DISABLE_PASSWORD_LOGINS]=0;;
+      root) CONFIG[SSH_DISABLE_PASSWORD_LOGINS]="root";;
+      disable) CONFIG[SSH_DISABLE_PASSWORD_LOGINS]=1;;
+    esac
+    
+    # SSH public key
+    if [[ "$ssh_pwd" == "disable" ]]; then
+      # pubkey is REQUIRED when password logins are disabled
+      msgbox "SSH public key required" \
+"you selected 'disable for all users (pubkey only)'.
+
+this means SSH password authentication will be disabled.
+you MUST provide a valid public key, or you won't be able to login!
+
+if you don't have a public key yet, generate one with:
+  ssh-keygen -t ed25519"
+      
+      local pubkey
+      pubkey=$(inputbox_required "SSH public key" \
+"paste your SSH public key (entire line):
+
+example:
+ssh-ed25519 AAAAC3N...xyz user@host" "")
+      check_abort "$pubkey"
+      CONFIG[SSH_PUBKEY]="$pubkey"
+    else
+      # pubkey is optional when password auth is allowed
+      if yesno "SSH public key" \
+"would you like to add an SSH public key?
+
+this allows passwordless SSH login using your key.
+    you can add multiple keys by editing dietpi.txt later." "no"; then
+        local pubkey
+        pubkey=$(inputbox_required "SSH public key" \
+"paste your SSH public key (entire line):
+
+example:
+ssh-ed25519 AAAAC3N...xyz user@host" "")
+        check_abort "$pubkey"
+        CONFIG[SSH_PUBKEY]="$pubkey"
+      fi
+    fi
+  fi
+}
+
+# ------------- software installation -------------
+
+wizard_software() {
+  log "configuring software installation..."
+  
+  # automated installation
+  if yesno "automated installation" \
+"enable fully automated first boot installation?
+
+when enabled:
+  • no user interaction required on first boot
+  • all selected software will be installed automatically
+  • updates and initial setup run without prompts
+
+IMPORTANT: make sure to change the global password from 'dietpi'!" "no"; then
+    CONFIG[AUTOMATED]=1
+  else
+    CONFIG[AUTOMATED]=0
+  fi
+  
+  # software packages
+  if yesno "DietPi software" \
+"would you like to install software packages automatically?
+
+DietPi offers many pre-configured software options.
+full list: https://dietpi.com/docs/software/" "no"; then
+    
+    msgbox "software installation" \
+"you can install software by entering their ID numbers.
+
+common software IDs:
+  16 = Pi-hole (ad blocker)
+  17 = Home Assistant
+  23 = LXDE (desktop environment)
+  65 = Docker
+  114 = Node.js
+  130 = Python 3
+  152 = Nginx
+  160 = Portainer
+
+full list: https://github.com/MichaIng/DietPi/wiki/DietPi-Software-list"
+    
+    local software_ids
+    software_ids=$(inputbox "software IDs" \
+"enter software IDs to install (space-separated):
+
+example: 65 160
+leave empty to skip." "")
+    check_abort "$software_ids"
+    [[ -n "$software_ids" ]] && CONFIG[INSTALL_SOFTWARE_ID]="$software_ids"
+  fi
+  
+  # APT packages
+  if yesno "APT packages" \
+"would you like to install additional APT packages?
+
+these are standard Debian packages installed via apt." "no"; then
+    local apt_pkgs
+    apt_pkgs=$(inputbox "APT packages" \
+"enter package names to install (space-separated):
+
+example: git htop vim curl
+leave empty to skip." "")
+    check_abort "$apt_pkgs"
+    [[ -n "$apt_pkgs" ]] && CONFIG[APT_INSTALLS]="$apt_pkgs"
+  fi
+  
+  # logging
+  local logging
+  logging=$(menu "logging mode" \
+"select logging mode:" \
+    "ramlog_clear" "RAMlog hourly clear (minimal writes)" \
+    "ramlog_save" "RAMlog hourly save + clear" \
+    "rsyslog" "Rsyslog + Logrotate (traditional)" \
+    "none" "none/custom")
+  check_abort "$logging"
+  case "$logging" in
+    ramlog_clear) CONFIG[LOGGING_INDEX]=-1;;
+    ramlog_save) CONFIG[LOGGING_INDEX]=-2;;
+    rsyslog) CONFIG[LOGGING_INDEX]=-3;;
+    none) CONFIG[LOGGING_INDEX]=0;;
+  esac
+
+  local ramlog_max
+  ramlog_max=$(inputbox "RAMlog max size" \
+"tmpfs size for RAMlog in MiB (used by RAMlog modes; default 50)" \
+"${CONFIG[RAMLOG_MAXSIZE]}")
+  check_abort "$ramlog_max"
+  [[ -n "$ramlog_max" ]] && CONFIG[RAMLOG_MAXSIZE]="$ramlog_max"
+  
+  # autostart
+  local autostart
+  autostart=$(menu "autostart option" \
+"what should start automatically after boot?" \
+    "console" "console (default)" \
+    "console_autologin" "console with auto-login" \
+    "desktop_autologin" "desktop with auto-login" \
+    "desktop_login" "desktop (login required)")
+  check_abort "$autostart"
+  case "$autostart" in
+    console) CONFIG[AUTOSTART_TARGET_INDEX]=0;;
+    console_autologin) CONFIG[AUTOSTART_TARGET_INDEX]=7;;
+    desktop_autologin) CONFIG[AUTOSTART_TARGET_INDEX]=2;;
+    desktop_login) CONFIG[AUTOSTART_TARGET_INDEX]=16;;
+  esac
+  
+  # autostart user (if relevant)
+  if [[ "${CONFIG[AUTOSTART_TARGET_INDEX]}" != "0" ]]; then
+    local autostart_user
+    autostart_user=$(inputbox_required "autologin user" \
+"which user should auto-login? (default: root)" "${CONFIG[AUTOSTART_LOGIN_USER]:-root}")
+    check_abort "$autostart_user"
+    CONFIG[AUTOSTART_LOGIN_USER]="$autostart_user"
+  fi
+  
+  # software preferences
+  wizard_software_preferences
+}
+
+wizard_software_preferences() {
+  msgbox "software preferences" \
+"some software installations require dependencies like:
+  • webserver (for web applications)
+  • desktop (for GUI applications)
+  • browser (for desktop environments)
+
+the next few options set your preferences for these."
+  
+  # webserver preference
+  local webserver
+  webserver=$(menu "webserver preference" \
+"if a webserver is needed, which should be installed?" \
+    "apache" "Apache (default)" \
+    "nginx" "Nginx (lightweight)" \
+    "lighttpd" "Lighttpd")
+  check_abort "$webserver"
+  case "$webserver" in
+    apache) CONFIG[WEB_SERVER_INDEX]=0;;
+    nginx) CONFIG[WEB_SERVER_INDEX]=-1;;
+    lighttpd) CONFIG[WEB_SERVER_INDEX]=-2;;
+  esac
+  
+  # desktop preference  
+  local desktop
+  desktop=$(menu "desktop preference" \
+"if a desktop is needed, which should be installed?" \
+    "lxde" "LXDE (lightweight)" \
+    "xfce" "Xfce" \
+    "mate" "MATE" \
+    "lxqt" "LXQt" \
+    "gnustep" "GNUstep")
+  check_abort "$desktop"
+  case "$desktop" in
+    lxde) CONFIG[DESKTOP_INDEX]=0;;
+    xfce) CONFIG[DESKTOP_INDEX]=-1;;
+    mate) CONFIG[DESKTOP_INDEX]=-2;;
+    lxqt) CONFIG[DESKTOP_INDEX]=-3;;
+    gnustep) CONFIG[DESKTOP_INDEX]=-4;;
+  esac
+  
+  # browser preference
+  local browser
+  browser=$(menu "browser preference" \
+"if a browser is needed, which should be installed?" \
+    "firefox" "Firefox" \
+    "chromium" "Chromium" \
+    "none" "none")
+  check_abort "$browser"
+  case "$browser" in
+    firefox) CONFIG[BROWSER_INDEX]=-1;;
+    chromium) CONFIG[BROWSER_INDEX]=-2;;
+    none) CONFIG[BROWSER_INDEX]=0;;
+  esac
+  
+  # optional software features
+  wizard_optional_software
+}
+
+# ------------- optional software configuration -------------
+
+wizard_optional_software() {
+  # WireGuard configuration
+  if yesno "WireGuard VPN" \
+"would you like to configure WireGuard VPN server settings?" "no"; then
+    local wg_mode
+    wg_mode=$(menu "WireGuard mode" \
+"select WireGuard operation mode:" \
+      "Server" "Server mode (recommended)" \
+      "Client" "Client mode")
+    check_abort "$wg_mode"
+    [[ -n "$wg_mode" ]] && CONFIG[SOFTWARE_WIREGUARD_MODE]="$wg_mode"
+    
+    local wg_port
+    wg_port=$(inputbox "WireGuard port" \
+"port for WireGuard to listen on (default: 51820)" \
+"${CONFIG[SOFTWARE_WIREGUARD_PORT]}")
+    check_abort "$wg_port"
+    [[ -n "$wg_port" ]] && CONFIG[SOFTWARE_WIREGUARD_PORT]="$wg_port"
+  fi
+  
+  # VNC Server configuration
+  if yesno "VNC Server" \
+"would you like to configure VNC Server settings?" "no"; then
+    local vnc_width
+    vnc_width=$(inputbox "VNC screen width" \
+"screen width in pixels" "${CONFIG[SOFTWARE_VNCSERVER_WIDTH]}")
+    check_abort "$vnc_width"
+    [[ -n "$vnc_width" ]] && CONFIG[SOFTWARE_VNCSERVER_WIDTH]="$vnc_width"
+    
+    local vnc_height
+    vnc_height=$(inputbox "VNC screen height" \
+"screen height in pixels" "${CONFIG[SOFTWARE_VNCSERVER_HEIGHT]}")
+    check_abort "$vnc_height"
+    [[ -n "$vnc_height" ]] && CONFIG[SOFTWARE_VNCSERVER_HEIGHT]="$vnc_height"
+    
+    local vnc_depth
+    vnc_depth=$(menu "VNC color depth" \
+"select color depth:" \
+      "8" "8 bits (256 colors)" \
+      "16" "16 bits (65k colors)" \
+      "24" "24 bits (16M colors)" \
+      "32" "32 bits (32-bit RGBA)")
+    check_abort "$vnc_depth"
+    [[ -n "$vnc_depth" ]] && CONFIG[SOFTWARE_VNCSERVER_DEPTH]="$vnc_depth"
+    
+    local vnc_display
+    vnc_display=$(inputbox "VNC display number" \
+"display index (usually 1)" "${CONFIG[SOFTWARE_VNCSERVER_DISPLAY_INDEX]}")
+    check_abort "$vnc_display"
+    [[ -n "$vnc_display" ]] && CONFIG[SOFTWARE_VNCSERVER_DISPLAY_INDEX]="$vnc_display"
+    
+    if yesno "VNC desktop sharing" \
+"enable desktop sharing mode? (show desktop to all viewers)" "no"; then
+      CONFIG[SOFTWARE_VNCSERVER_SHARE_DESKTOP]=1
+    else
+      CONFIG[SOFTWARE_VNCSERVER_SHARE_DESKTOP]=0
+    fi
+  fi
+  
+  # ownCloud/Nextcloud configuration
+  if yesno "ownCloud/Nextcloud" \
+"would you like to configure ownCloud/Nextcloud settings?" "no"; then
+    local oc_user
+    oc_user=$(inputbox "ownCloud admin username" \
+"admin account username (default: admin)" \
+"${CONFIG[SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME]}")
+    check_abort "$oc_user"
+    [[ -n "$oc_user" ]] && CONFIG[SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME]="$oc_user"
+    
+    local oc_datadir
+    oc_datadir=$(inputbox "ownCloud data directory" \
+"where to store ownCloud data" \
+"${CONFIG[SOFTWARE_OWNCLOUD_DATADIR]}")
+    check_abort "$oc_datadir"
+    [[ -n "$oc_datadir" ]] && CONFIG[SOFTWARE_OWNCLOUD_DATADIR]="$oc_datadir"
+    
+    local nc_datadir
+    nc_datadir=$(inputbox "Nextcloud data directory" \
+"where to store Nextcloud data" \
+"${CONFIG[SOFTWARE_NEXTCLOUD_DATADIR]}")
+    check_abort "$nc_datadir"
+    [[ -n "$nc_datadir" ]] && CONFIG[SOFTWARE_NEXTCLOUD_DATADIR]="$nc_datadir"
+  fi
+  
+  # Synapse (Matrix server) configuration
+  if yesno "Synapse Matrix server" \
+"would you like to configure Synapse (Matrix server) settings?" "no"; then
+    local synapse_user
+    synapse_user=$(inputbox "Synapse admin username" \
+"admin account username (default: dietpi)" \
+"${CONFIG[SOFTWARE_SYNAPSE_USERNAME]}")
+    check_abort "$synapse_user"
+    [[ -n "$synapse_user" ]] && CONFIG[SOFTWARE_SYNAPSE_USERNAME]="$synapse_user"
+  fi
+  
+  # WiFi Hotspot configuration (only if WiFi is enabled)
+  if [[ "${CONFIG[NET_WIFI_ENABLED]}" -eq 1 ]]; then
+    if yesno "WiFi Hotspot" \
+"would you like to configure WiFi hotspot settings?" "no"; then
+      local hotspot_ssid
+      hotspot_ssid=$(inputbox "WiFi hotspot SSID" \
+"network name for the hotspot" \
+"${CONFIG[SOFTWARE_WIFI_HOTSPOT_SSID]}")
+      check_abort "$hotspot_ssid"
+      [[ -n "$hotspot_ssid" ]] && CONFIG[SOFTWARE_WIFI_HOTSPOT_SSID]="$hotspot_ssid"
+      
+      local hotspot_key
+      hotspot_key=$(inputbox "WiFi hotspot password" \
+"password for the hotspot (min 8 chars)" \
+"${CONFIG[SOFTWARE_WIFI_HOTSPOT_KEY]}")
+      check_abort "$hotspot_key"
+      [[ -n "$hotspot_key" ]] && CONFIG[SOFTWARE_WIFI_HOTSPOT_KEY]="$hotspot_key"
+      
+      local hotspot_channel
+      hotspot_channel=$(inputbox "WiFi hotspot channel" \
+"channel 1-13 (2.4GHz) or 36+ (5GHz)" \
+"${CONFIG[SOFTWARE_WIFI_HOTSPOT_CHANNEL]}")
+      check_abort "$hotspot_channel"
+      [[ -n "$hotspot_channel" ]] && CONFIG[SOFTWARE_WIFI_HOTSPOT_CHANNEL]="$hotspot_channel"
+      
+      # WiFi standards
+      if yesno "WiFi 4 (802.11n)" \
+"enable WiFi 4 (802.11n)?" "no"; then
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI4]=1
+      else
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI4]=0
+      fi
+      
+      if yesno "WiFi 5 (802.11ac)" \
+"enable WiFi 5 (802.11ac)?" "no"; then
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI5]=1
+      else
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI5]=0
+      fi
+      
+      if yesno "WiFi 6 (802.11ax)" \
+"enable WiFi 6 (802.11ax)?" "no"; then
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI6]=1
+      else
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI6]=0
+      fi
+      
+      # 5G band settings
+      if yesno "5GHz band" \
+"enable 5GHz band for hotspot?" "no"; then
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_5G]=1
+        
+        local hotspot_5g_channel
+        hotspot_5g_channel=$(inputbox "5GHz channel" \
+"5GHz channel (36, 40, 44, 48, etc.)" \
+"${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL]}")
+        check_abort "$hotspot_5g_channel"
+        [[ -n "$hotspot_5g_channel" ]] && CONFIG[SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL]="$hotspot_5g_channel"
+      else
+        CONFIG[SOFTWARE_WIFI_HOTSPOT_5G]=0
+      fi
+    fi
+  fi
+  
+  # Chromium configuration
+  if yesno "Chromium browser" \
+"would you like to configure Chromium startup settings?" "no"; then
+    local chromium_res_x
+    chromium_res_x=$(inputbox "Chromium window width" \
+"width in pixels (default: 1280)" \
+"${CONFIG[SOFTWARE_CHROMIUM_RES_X]}")
+    check_abort "$chromium_res_x"
+    [[ -n "$chromium_res_x" ]] && CONFIG[SOFTWARE_CHROMIUM_RES_X]="$chromium_res_x"
+    
+    local chromium_res_y
+    chromium_res_y=$(inputbox "Chromium window height" \
+"height in pixels (default: 720)" \
+"${CONFIG[SOFTWARE_CHROMIUM_RES_Y]}")
+    check_abort "$chromium_res_y"
+    [[ -n "$chromium_res_y" ]] && CONFIG[SOFTWARE_CHROMIUM_RES_Y]="$chromium_res_y"
+    
+    local chromium_url
+    chromium_url=$(inputbox "Chromium startup URL" \
+"URL to load on startup" \
+"${CONFIG[SOFTWARE_CHROMIUM_AUTOSTART_URL]}")
+    check_abort "$chromium_url"
+    [[ -n "$chromium_url" ]] && CONFIG[SOFTWARE_CHROMIUM_AUTOSTART_URL]="$chromium_url"
+  fi
+  
+  # Home Assistant configuration
+  if yesno "Home Assistant" \
+"would you like to configure Home Assistant dependencies?" "no"; then
+    local ha_apt
+    ha_apt=$(inputbox "Home Assistant APT dependencies" \
+"space-separated APT package names (or leave empty)" \
+"${CONFIG[SOFTWARE_HOMEASSISTANT_APT_DEPS]}")
+    check_abort "$ha_apt"
+    CONFIG[SOFTWARE_HOMEASSISTANT_APT_DEPS]="$ha_apt"
+    
+    local ha_pip
+    ha_pip=$(inputbox "Home Assistant PIP dependencies" \
+"space-separated PIP package names (or leave empty)" \
+"${CONFIG[SOFTWARE_HOMEASSISTANT_PIP_DEPS]}")
+    check_abort "$ha_pip"
+    CONFIG[SOFTWARE_HOMEASSISTANT_PIP_DEPS]="$ha_pip"
+  fi
+  
+  # K3s configuration
+  if yesno "K3s Kubernetes" \
+"would you like to configure K3s server options?" "no"; then
+    local k3s_exec
+    k3s_exec=$(inputbox "K3s exec arguments" \
+"additional arguments for k3s server (or leave empty)" \
+"${CONFIG[SOFTWARE_K3S_EXEC]}")
+    check_abort "$k3s_exec"
+    CONFIG[SOFTWARE_K3S_EXEC]="$k3s_exec"
+  fi
+  
+  # DietPi-Dashboard configuration
+  if yesno "DietPi-Dashboard" \
+"would you like to configure DietPi-Dashboard?" "no"; then
+    local dashboard_version
+    dashboard_version=$(menu "Dashboard version" \
+"select DietPi-Dashboard version:" \
+      "Latest" "Latest (unstable)" \
+      "Stable" "Stable (default)")
+    check_abort "$dashboard_version"
+    [[ -n "$dashboard_version" ]] && CONFIG[SOFTWARE_DIETPI_DASHBOARD_VERSION]="$dashboard_version"
+    
+    if yesno "Dashboard backend" \
+"use Kotlin backend? (0=Go, 1=Kotlin)" "no"; then
+      CONFIG[SOFTWARE_DIETPI_DASHBOARD_BACKEND]=1
+    else
+      CONFIG[SOFTWARE_DIETPI_DASHBOARD_BACKEND]=0
+    fi
+  fi
+  
+  # UrBackup configuration
+  if yesno "UrBackup Server" \
+"would you like to configure UrBackup backup location?" "no"; then
+    local urbackup_path
+    urbackup_path=$(inputbox "UrBackup backup path" \
+"directory for backups" \
+"${CONFIG[SOFTWARE_URBACKUP_BACKUPPATH]}")
+    check_abort "$urbackup_path"
+    [[ -n "$urbackup_path" ]] && CONFIG[SOFTWARE_URBACKUP_BACKUPPATH]="$urbackup_path"
+  fi
+  
+  # Roon Server configuration
+  if yesno "Roon Server" \
+"would you like to enable Roon Server Early Access?" "no"; then
+    CONFIG[SOFTWARE_ROONSERVER_EARLYACCESS]=1
+  else
+    CONFIG[SOFTWARE_ROONSERVER_EARLYACCESS]=0
+  fi
+}
+
+# ------------- advanced settings -------------
+
+wizard_advanced() {
+  debug "wizard_advanced() called"
+  log "configuring advanced settings..."
+  
+  # survey
+  local survey
+  debug "  Getting DietPi survey preference"
+  survey=$(menu "DietPi survey" \
+"participate in the DietPi project survey?
+
+helps the developers understand how DietPi is used.
+https://dietpi.com/docs/dietpi_tools/system_configuration/#dietpi-survey" \
+    "ask_on_boot" "ask on first boot (default)" \
+    "opt_in" "opt in" \
+    "opt_out" "opt out")
+  check_abort "$survey"
+  case "$survey" in
+    ask_on_boot) CONFIG[SURVEY_OPTED_IN]=-1;;
+    opt_in) CONFIG[SURVEY_OPTED_IN]=1;;
+    opt_out) CONFIG[SURVEY_OPTED_IN]=0;;
+  esac
+  
+  # CPU governor
+  local cpu_gov
+  cpu_gov=$(menu "CPU governor" \
+"select CPU frequency scaling governor:" \
+    "schedutil" "schedutil (default, balanced)" \
+    "ondemand" "ondemand (dynamic scaling)" \
+    "performance" "performance (max speed)" \
+    "powersave" "powersave (low power)" \
+    "conservative" "conservative (gradual scaling)")
+  check_abort "$cpu_gov"
+  [[ -n "$cpu_gov" ]] && CONFIG[CPU_GOVERNOR]="$cpu_gov"
+
+  if yesno "CPU frequency limits" \
+"set max/min CPU frequencies? use 'Disabled' to keep defaults." "no"; then
+    local cpu_max
+    cpu_max=$(inputbox "CPU max frequency" \
+"enter MHz or percentage (Intel) or 'Disabled'" "${CONFIG[CPU_MAX_FREQ]}")
+    check_abort "$cpu_max"
+    [[ -n "$cpu_max" ]] && CONFIG[CPU_MAX_FREQ]="$cpu_max"
+
+    local cpu_min
+    cpu_min=$(inputbox "CPU min frequency" \
+"enter MHz or percentage (Intel) or 'Disabled'" "${CONFIG[CPU_MIN_FREQ]}")
+    check_abort "$cpu_min"
+    [[ -n "$cpu_min" ]] && CONFIG[CPU_MIN_FREQ]="$cpu_min"
+  fi
+  
+  # update checks
+  local check_updates
+  check_updates=$(menu "DietPi update checks" \
+"check for DietPi updates daily?" \
+    "daily" "yes, check daily (recommended)" \
+    "never" "no, don't check")
+  check_abort "$check_updates"
+  case "$check_updates" in
+    daily) CONFIG[CHECK_DIETPI_UPDATES]=1;;
+    never) CONFIG[CHECK_DIETPI_UPDATES]=0;;
+  esac
+  
+  local check_apt
+  check_apt=$(menu "APT update checks" \
+"check for APT package updates?" \
+    "check_only" "check only (no auto-upgrade)" \
+    "auto_upgrade" "check and upgrade automatically" \
+    "disabled" "disabled, don't check")
+  check_abort "$check_apt"
+  case "$check_apt" in
+    check_only) CONFIG[CHECK_APT_UPDATES]=1;;
+    auto_upgrade) CONFIG[CHECK_APT_UPDATES]=2;;
+    disabled) CONFIG[CHECK_APT_UPDATES]=0;;
+  esac
+  
+  # NTP mode
+  local ntp_mode
+  ntp_mode=$(menu "network time sync" \
+"when should time be synchronized?" \
+    "boot_daily" "boot + daily (recommended)" \
+    "daemon_drift" "daemon + drift correction" \
+    "boot_hourly" "boot + hourly" \
+    "boot_only" "boot only" \
+    "disabled" "disabled")
+  check_abort "$ntp_mode"
+  case "$ntp_mode" in
+    boot_daily) CONFIG[NTP_MODE]=2;;
+    daemon_drift) CONFIG[NTP_MODE]=4;;
+    boot_hourly) CONFIG[NTP_MODE]=3;;
+    boot_only) CONFIG[NTP_MODE]=1;;
+    disabled) CONFIG[NTP_MODE]=0;;
+  esac
+
+  if yesno "NTP servers" \
+"choose NTP source (DHCP default, gateway, or custom list)?" "no"; then
+    local ntp_choice
+    ntp_choice=$(menu "NTP mirror" \
+"select NTP source" \
+      "default" "DHCP-provided or debian pool" \
+      "gateway" "use router/gateway" \
+      "custom" "enter custom server(s)")
+    check_abort "$ntp_choice"
+
+    if [[ "$ntp_choice" == "custom" ]]; then
+      ntp_choice=$(inputbox_required "custom NTP servers" \
+"space-separated hostnames/IPs or pool domain" "${CONFIG[NTP_MIRROR]}")
+      check_abort "$ntp_choice"
+    fi
+
+    CONFIG[NTP_MIRROR]="$ntp_choice"
+  fi
+  
+  # IPv6
+  if yesno "IPv6 support" \
+"enable IPv6 support?
+
+disable if your network doesn't support IPv6."; then
+    CONFIG[ENABLE_IPV6]=1
+  else
+    CONFIG[ENABLE_IPV6]=0
+  fi
+  
+  # CPU Ondemand tuning (only if CPU governor is ondemand)
+  if [[ "${CONFIG[CPU_GOVERNOR]}" == "ondemand" ]]; then
+    if yesno "CPU Ondemand tuning" \
+"configure advanced ondemand CPU governor settings?" "no"; then
+      local sample_rate
+      sample_rate=$(inputbox "CPU Ondemand sample rate" \
+"sampling rate for ondemand governor (microseconds)" \
+"${CONFIG[CPU_ONDEMAND_SAMPLE_RATE]}")
+      check_abort "$sample_rate"
+      [[ -n "$sample_rate" ]] && CONFIG[CPU_ONDEMAND_SAMPLE_RATE]="$sample_rate"
+      
+      local sample_down
+      sample_down=$(inputbox "CPU Ondemand sample downfactor" \
+"scale down factor for sampling (higher = less frequent scale up)" \
+"${CONFIG[CPU_ONDEMAND_SAMPLE_DOWNFACTOR]}")
+      check_abort "$sample_down"
+      [[ -n "$sample_down" ]] && CONFIG[CPU_ONDEMAND_SAMPLE_DOWNFACTOR]="$sample_down"
+      
+      local throttle_up
+      throttle_up=$(inputbox "CPU usage throttle-up threshold" \
+"CPU usage percentage to trigger throttle-up (0-100)" \
+"${CONFIG[CPU_USAGE_THROTTLE_UP]}")
+      check_abort "$throttle_up"
+      [[ -n "$throttle_up" ]] && CONFIG[CPU_USAGE_THROTTLE_UP]="$throttle_up"
+    fi
+  fi
+  
+  # CPU turbo
+  if yesno "CPU turbo boost" \
+"disable CPU turbo/boost to reduce power consumption and heat?" "no"; then
+    CONFIG[CPU_DISABLE_TURBO]=1
+  else
+    CONFIG[CPU_DISABLE_TURBO]=0
+  fi
+  
+  # GPU driver
+  local gpu_driver
+  gpu_driver=$(menu "GPU driver" \
+"select GPU driver (if applicable to your hardware)" \
+    "none" "none (default)" \
+    "mali" "Mali (Raspberry Pi)" \
+    "vc4" "VC4 (Raspberry Pi)" \
+    "v3d" "V3D (Raspberry Pi 4)")
+  check_abort "$gpu_driver"
+  [[ -n "$gpu_driver" ]] && CONFIG[GPU_DRIVER]="$gpu_driver"
+  
+  # Sound card selection
+  local soundcard
+  soundcard=$(menu "sound card" \
+"select sound card device" \
+    "none" "none (default)" \
+    "bcm2835" "BCM2835 (Raspberry Pi)" \
+    "default" "default (auto-detect)")
+  check_abort "$soundcard"
+  [[ -n "$soundcard" ]] && CONFIG[SOUNDCARD]="$soundcard"
+  
+  # LCD panel selection
+  local lcd_panel
+  lcd_panel=$(menu "LCD panel" \
+"select LCD panel driver (if using display module)" \
+    "none" "none (default)" \
+    "1" "LCD 16x2" \
+    "2" "LCD 20x4" \
+    "7" "OLED 128x32")
+  check_abort "$lcd_panel"
+  [[ -n "$lcd_panel" ]] && CONFIG[LCDPANEL]="$lcd_panel"
+  
+  # X11 DPI
+  local xorg_dpi
+  xorg_dpi=$(inputbox "X11 DPI" \
+"screen DPI for X11 (96 is default)" \
+"${CONFIG[SOFTWARE_XORG_DPI]}")
+  check_abort "$xorg_dpi"
+  [[ -n "$xorg_dpi" ]] && CONFIG[SOFTWARE_XORG_DPI]="$xorg_dpi"
+  
+  # Connection settings
+  if yesno "connection settings" \
+"configure connection timeout and testing parameters?" "no"; then
+    local url_timeout
+    url_timeout=$(inputbox "URL check timeout" \
+"timeout in seconds for connection checks" \
+"${CONFIG[G_CHECK_URL_TIMEOUT]}")
+    check_abort "$url_timeout"
+    [[ -n "$url_timeout" ]] && CONFIG[G_CHECK_URL_TIMEOUT]="$url_timeout"
+    
+    local url_attempts
+    url_attempts=$(inputbox "URL check attempts" \
+"number of connection attempts before giving up" \
+"${CONFIG[G_CHECK_URL_ATTEMPTS]}")
+    check_abort "$url_attempts"
+    [[ -n "$url_attempts" ]] && CONFIG[G_CHECK_URL_ATTEMPTS]="$url_attempts"
+    
+    local check_ip
+    check_ip=$(inputbox "connection check IP" \
+"IP address to use for connection tests" \
+"${CONFIG[CHECK_CONNECTION_IP]}")
+    check_abort "$check_ip"
+    [[ -n "$check_ip" ]] && CONFIG[CHECK_CONNECTION_IP]="$check_ip"
+    
+    local check_ipv6
+    check_ipv6=$(inputbox "connection check IPv6" \
+"IPv6 address to use for connection tests" \
+"${CONFIG[CHECK_CONNECTION_IPV6]}")
+    check_abort "$check_ipv6"
+    [[ -n "$check_ipv6" ]] && CONFIG[CHECK_CONNECTION_IPV6]="$check_ipv6"
+    
+    local check_dns
+    check_dns=$(inputbox "DNS test domain" \
+"domain to use for DNS resolution tests" \
+"${CONFIG[CHECK_DNS_DOMAIN]}")
+    check_abort "$check_dns"
+    [[ -n "$check_dns" ]] && CONFIG[CHECK_DNS_DOMAIN]="$check_dns"
+  fi
+
+  if yesno "APT mirrors" \
+"override Debian/Raspbian APT mirrors?" "no"; then
+    local deb_mirror
+    deb_mirror=$(inputbox_required "Debian mirror" \
+"enter Debian mirror URL" "${CONFIG[APT_DEBIAN_MIRROR]}")
+    check_abort "$deb_mirror"
+    CONFIG[APT_DEBIAN_MIRROR]="$deb_mirror"
+
+    local rasp_mirror
+    rasp_mirror=$(inputbox_required "Raspbian mirror" \
+"enter Raspbian mirror URL" "${CONFIG[APT_RASPBIAN_MIRROR]}")
+    check_abort "$rasp_mirror"
+    CONFIG[APT_RASPBIAN_MIRROR]="$rasp_mirror"
+  fi
+
+  if yesno "DietPi dev settings" \
+"set DietPi git branch/owner (for testing/dev builds)?" "no"; then
+    local git_branch
+    git_branch=$(inputbox "git branch" "branch to use" "${CONFIG[DEV_GITBRANCH]:-master}")
+    check_abort "$git_branch"
+    [[ -n "$git_branch" ]] && CONFIG[DEV_GITBRANCH]="$git_branch"
+
+    local git_owner
+    git_owner=$(inputbox "git owner" "GitHub owner" "${CONFIG[DEV_GITOWNER]:-MichaIng}")
+    check_abort "$git_owner"
+    [[ -n "$git_owner" ]] && CONFIG[DEV_GITOWNER]="$git_owner"
+  fi
+}
+
+# ------------- Generate dietpi.txt -------------
+
+generate_dietpi_txt() {
+  local output_file="$1"
+  
+  cat > "$output_file" <<'TEMPLATE_EOF'
+# IMPORTANT:
+# - This is intended for advanced users, unless you know what you are doing, do not edit this file. Please use the DietPi programs instead.
+# - Do not remove uncommented lines, as the items are scraped by DietPi programs, on demand.
+
+#------------------------------------------------------------------------------------------------------
+##### DietPi-Automation settings, applied on first boot of DietPi only, ONCE! #####
+#------------------------------------------------------------------------------------------------------
+# Initial user and default software installation password
+# - Sets "root" and "dietpi" user's login passwords and is used by dietpi-software as default for software installs which require a password.
+# - Once applied during first run setup, the password is removed from this file, encrypted and stored to a safer location to be used by dietpi-software only.
+# - WARN: The default SSH server Dropbear does not support passwords over 100 bytes. Certain special characters, and such with accents, take 2 bytes.
+# - WARN: We cannot guarantee that all software options can handle special characters like $"|\.
+TEMPLATE_EOF
+
+  # Global password
+  cat >> "$output_file" <<EOF
+AUTO_SETUP_GLOBAL_PASSWORD=${CONFIG[GLOBAL_PASSWORD]}
+
+##### Language/Regional options #####
+# Locale e.g.: "en_GB.UTF-8" / "de_DE.UTF-8" | One entry and UTF-8 ONLY!
+AUTO_SETUP_LOCALE=${CONFIG[LOCALE]}
+
+# Keyboard layout e.g.: "gb" / "us" / "de" / "fr"
+AUTO_SETUP_KEYBOARD_LAYOUT=${CONFIG[KEYBOARD_LAYOUT]}
+
+# Time zone e.g.: "Europe/London" / "America/New_York" | Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+AUTO_SETUP_TIMEZONE=${CONFIG[TIMEZONE]}
+
+##### Network options #####
+# Enable Ethernet or WiFi adapter: 1=enable | 0=disable
+# - If both Ethernet and WiFi are enabled, WiFi will take priority and Ethernet will be disabled.
+# - If using WiFi, please edit dietpi-wifi.txt to pre-enter credentials.
+AUTO_SETUP_NET_ETHERNET_ENABLED=${CONFIG[NET_ETHERNET_ENABLED]}
+AUTO_SETUP_NET_WIFI_ENABLED=${CONFIG[NET_WIFI_ENABLED]}
+
+# WiFi country code: 2 capital letter value (e.g. GB US DE JP): https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
+# - NB: This choice may be overridden if the WiFi access point sends a country code.
+AUTO_SETUP_NET_WIFI_COUNTRY_CODE=${CONFIG[NET_WIFI_COUNTRY_CODE]}
+
+# Enter your static network details below, if applicable.
+AUTO_SETUP_NET_USESTATIC=${CONFIG[NET_USESTATIC]}
+AUTO_SETUP_NET_STATIC_IP=${CONFIG[NET_STATIC_IP]}
+AUTO_SETUP_NET_STATIC_MASK=${CONFIG[NET_STATIC_MASK]}
+AUTO_SETUP_NET_STATIC_GATEWAY=${CONFIG[NET_STATIC_GATEWAY]}
+AUTO_SETUP_NET_STATIC_DNS=${CONFIG[NET_STATIC_DNS]}
+
+# Set to "1" to convert DHCP leased network settings into static settings automatically on first boot.
+AUTO_SETUP_DHCP_TO_STATIC=${CONFIG[NET_DHCP_TO_STATIC]}
+
+# Hostname
+AUTO_SETUP_NET_HOSTNAME=${CONFIG[NET_HOSTNAME]}
+
+# Force Ethernet speeds: 0=automatic speed | 10 = 10 Mbit/s | 100 = 100 Mbit/s etc.
+# - Use this when your Ethernet adapter has an unstable 1 Gbit/s link.
+AUTO_SETUP_NET_ETH_FORCE_SPEED=${CONFIG[NET_ETH_FORCE_SPEED]}
+
+# Delay service starts at boot until network is established: 0=disabled | 1=enabled
+AUTO_SETUP_BOOT_WAIT_FOR_NETWORK=${CONFIG[BOOT_WAIT_FOR_NETWORK]}
+
+##### Misc options #####
+# Swap space size to generate: 0 => disable | 1 => auto | 2 and up => size in MiB
+AUTO_SETUP_SWAPFILE_SIZE=${CONFIG[SWAPFILE_SIZE]}
+# Swap space location: "zram" => swap space on /dev/zram0 (auto-size = 50% of RAM size) | /path/to/file => swap file at location (auto-size = 2 GiB minus RAM size)
+AUTO_SETUP_SWAPFILE_LOCATION=${CONFIG[SWAPFILE_LOCATION]}
+
+# Set to "1" to disable HDMI/video output and framebuffers on Raspberry Pi, to reduce power consumption and memory usage: Works on RPi only!
+AUTO_SETUP_HEADLESS=${CONFIG[HEADLESS]}
+
+# Serial console: Set to "0" if you do not require a serial console. It will then be disabled automatically on first boot.
+# - If you leave it at "1", and first login does not happen on a serial console, a dialogue offers to disable it instead.
+CONFIG_SERIAL_CONSOLE_ENABLE=${CONFIG[SERIAL_CONSOLE_ENABLE]}
+
+# Unmask (enable) systemd-logind service (including dbus), which is masked by default on DietPi
+AUTO_UNMASK_LOGIND=${CONFIG[UNMASK_LOGIND]}
+
+# Install APT packages automatically after first run setup.
+# - Add as many APT package names as you wish, separated by space.
+# - They will be installed after dietpi-software options and before the script defined via AUTO_SETUP_CUSTOM_SCRIPT_EXEC (see below) is executed.
+# - E.g. the following (without the leading "#") will install the APT packages iotop, iptables and xz-utils:
+EOF
+
+  if [[ -n "${CONFIG[APT_INSTALLS]}" ]]; then
+    cat >> "$output_file" <<EOF
+AUTO_SETUP_APT_INSTALLS=${CONFIG[APT_INSTALLS]}
+
+EOF
+  else
+    cat >> "$output_file" <<'EOF'
+#AUTO_SETUP_APT_INSTALLS=iotop iptables xz-utils
+
+EOF
+  fi
+
+  # Custom scripts
+  cat >> "$output_file" <<EOF
+# Custom Script (pre-networking and pre-DietPi install)
+# - Allows you to automatically execute a custom script before network is up on first boot.
+# - Copy your script to /boot/Automation_Custom_PreScript.sh and it will be executed automatically.
+# - Executed script log: /var/tmp/dietpi/logs/dietpi-automation_custom_prescript.log
+
+# Custom Script (post-networking and post-DietPi install)
+# - Allows you to automatically execute a custom script at the end of DietPi install.
+# - Option 0 = Copy your script to /boot/Automation_Custom_Script.sh and it will be executed automatically.
+# - Option 1 = Host your script online, then use e.g. AUTO_SETUP_CUSTOM_SCRIPT_EXEC=https://myweb.com/myscript.sh and it will be downloaded and executed automatically.
+# - Executed script log: /var/tmp/dietpi/logs/dietpi-automation_custom_script.log
+AUTO_SETUP_CUSTOM_SCRIPT_EXEC=${CONFIG[CUSTOM_SCRIPT_EXEC]}
+
+# Restore a DietPi-Backup on first boot: 0 => disable | 1 => interactive restore (show list of found backups) | 2 => non-interactive restore (restore first found backup)
+# - Simply attach the drive/disk/stick which contains the backup. All attached drives will be mounted temporarily and searched automatically.
+AUTO_SETUP_BACKUP_RESTORE=${CONFIG[BACKUP_RESTORE]}
+
+EOF
+
+  # Software options
+  cat >> "$output_file" <<EOF
+##### Software options #####
+# SSH server choice: 0=none/custom | -1=Dropbear | -2=OpenSSH
+AUTO_SETUP_SSH_SERVER_INDEX=${CONFIG[SSH_SERVER_INDEX]}
+
+# SSH server pubkey
+# - Public key(s) for "root" and "dietpi" users, which will be added to ~/.ssh/authorized_keys
+# - Use the same setting multiple times for adding multiple keys.
+# - See SOFTWARE_DISABLE_SSH_PASSWORD_LOGINS below for disabling SSH password logins.
+EOF
+
+  if [[ -n "${CONFIG[SSH_PUBKEY]}" ]]; then
+    cat >> "$output_file" <<EOF
+AUTO_SETUP_SSH_PUBKEY=${CONFIG[SSH_PUBKEY]}
+
+EOF
+  else
+    cat >> "$output_file" <<'EOF'
+#AUTO_SETUP_SSH_PUBKEY=ssh-ed25519 AAAAAAAA111111111111BBBBBBBBBBBB222222222222cccccccccccc333333333333 mySSHkey
+
+EOF
+  fi
+
+  cat >> "$output_file" <<EOF
+# Logging mode choice: 0=none/custom | -1=RAMlog hourly clear | -2=RAMlog hourly save to disk + clear | -3=Rsyslog + Logrotate
+AUTO_SETUP_LOGGING_INDEX=${CONFIG[LOGGING_INDEX]}
+# RAMlog max tmpfs size (MiB). 50 MiB should be fine for single use. 200+ MiB for heavy webserver access log etc.
+AUTO_SETUP_RAMLOG_MAXSIZE=${CONFIG[RAMLOG_MAXSIZE]}
+
+# Dependency preferences
+# - DietPi-Software installs all dependencies for selected software options automatically, which can include a webserver for web applications, a desktop for GUI applications and one usually wants a web browser on desktops.
+# - Especially for non-interactive first run installs (see AUTO_SETUP_AUTOMATED below), you may want to define which webserver, desktop and/or browser you want to have installed in such case. For interactive installs you will be always asked to pick one.
+# - With below settings you can define your preference for non-interactive installs. However, it will only installed if any other selected software requires it, and an explicit webserver/desktop/browser selection overrides those settings:
+# - Webserver preference: 0=Apache | -1=Nginx | -2=Lighttpd
+AUTO_SETUP_WEB_SERVER_INDEX=${CONFIG[WEB_SERVER_INDEX]}
+# - Desktop preference: 0=LXDE | -1=Xfce | -2=MATE | -3=LXQt | -4=GNUstep
+AUTO_SETUP_DESKTOP_INDEX=${CONFIG[DESKTOP_INDEX]}
+# - Browser preference: 0=None | -1=Firefox | -2=Chromium
+AUTO_SETUP_BROWSER_INDEX=${CONFIG[BROWSER_INDEX]}
+
+# DietPi-Autostart: 0=Console | 7=Console autologin | 1=Kodi | 2=Desktop autologin | 16=Desktop | 4=OpenTyrian | 5=DietPi-CloudShell | 6=Amiberry fast boot | 8=Amiberry standard boot | 9=DDX-Rebirth | 10=CAVA Spectrum | 11=Chromium kiosk | 14=Custom script (background) | 17=Custom script (foreground)
+# - This will be effective on 2nd boot, after first run update and installs have been done.
+# - Related software titles must be installed either on first run installs or via AUTO_SETUP_AUTOMATED=1 + AUTO_SETUP_INSTALL_SOFTWARE_ID (see below).
+AUTO_SETUP_AUTOSTART_TARGET_INDEX=${CONFIG[AUTOSTART_TARGET_INDEX]}
+# Autologin user name
+# - This user must exist before first run installs, otherwise it will be reverted to root.
+# - Applies to all autostart options but: 0, 6, 14 and 16
+AUTO_SETUP_AUTOSTART_LOGIN_USER=${CONFIG[AUTOSTART_LOGIN_USER]}
+
+EOF
+
+  cat >> "$output_file" <<EOF
+##### Non-interactive first run setup #####
+# On first boot, run updates, initial setup, and optional software installs without any user interaction.
+# - Please change AUTO_SETUP_GLOBAL_PASSWORD when enabling this option!
+AUTO_SETUP_AUTOMATED=${CONFIG[AUTOMATED]}
+
+# Software to automatically install
+# - Requires AUTO_SETUP_AUTOMATED=1
+# - List of available software IDs: https://github.com/MichaIng/DietPi/wiki/DietPi-Software-list
+# - Add as many software IDs as you wish, separated by space.
+# - DietPi will automatically install all dependencies, like ALSA/X11 for desktops, a webserver for web applications etc.
+# - E.g. the following (without the leading "#") will install the LXDE desktop, the TigerVNC server and the Kodi media centre automatically on first boot:
+EOF
+
+  if [[ -n "${CONFIG[INSTALL_SOFTWARE_ID]}" ]]; then
+    cat >> "$output_file" <<EOF
+AUTO_SETUP_INSTALL_SOFTWARE_ID=${CONFIG[INSTALL_SOFTWARE_ID]}
+
+EOF
+  else
+    cat >> "$output_file" <<'EOF'
+#AUTO_SETUP_INSTALL_SOFTWARE_ID=23 28 31
+
+EOF
+  fi
+
+  # DietPi survey and misc
+  cat >> "$output_file" <<EOF
+#------------------------------------------------------------------------------------------------------
+##### Misc DietPi program settings #####
+#------------------------------------------------------------------------------------------------------
+# DietPi-Survey: 1=opt in | 0=opt out | -1=ask on first call
+# - https://dietpi.com/docs/dietpi_tools/system_configuration/#dietpi-survey
+SURVEY_OPTED_IN=${CONFIG[SURVEY_OPTED_IN]}
+
+EOF
+
+  # DietPi-Config settings
+  cat >> "$output_file" <<EOF
+#------------------------------------------------------------------------------------------------------
+##### DietPi-Config settings #####
+#------------------------------------------------------------------------------------------------------
+# CPU Governor: schedutil | ondemand | interactive | conservative | powersave | performance
+CONFIG_CPU_GOVERNOR=${CONFIG[CPU_GOVERNOR]}
+# Ondemand Sampling Rate | Min value: 10000 microseconds (10 ms)
+CONFIG_CPU_ONDEMAND_SAMPLE_RATE=${CONFIG[CPU_ONDEMAND_SAMPLE_RATE]}
+# Ondemand Sampling Down Factor: Sampling Rate * Down Factor / 1000 = ms (40 = 1000 ms when sampling rate is 25000)
+CONFIG_CPU_ONDEMAND_SAMPLE_DOWNFACTOR=${CONFIG[CPU_ONDEMAND_SAMPLE_DOWNFACTOR]}
+# Throttle Up Percentage: Percentage of average CPU usage during sampling rate at which CPU will be throttled up/down
+CONFIG_CPU_USAGE_THROTTLE_UP=${CONFIG[CPU_USAGE_THROTTLE_UP]}
+
+# CPU Frequency Limits: Disabled=disabled
+# - Intel CPUs use a percentage value (%) from 0-100, e.g.: 55
+# - All other devices must use a specific MHz value, e.g.: 1600
+# - Has no effect on RPi, please set "arm_freq" and "arm_freq_min" in config.txt instead.
+CONFIG_CPU_MAX_FREQ=${CONFIG[CPU_MAX_FREQ]}
+CONFIG_CPU_MIN_FREQ=${CONFIG[CPU_MIN_FREQ]}
+
+# Disable Intel-based turbo/boost stepping. This flag should not be required, setting <100% MAX frequency should disable Turbo on Intel CPUs.
+CONFIG_CPU_DISABLE_TURBO=${CONFIG[CPU_DISABLE_TURBO]}
+
+# GPU Driver | Will also be applied during 1st run if set to a value other than 'none'
+#   NB: x86_64 PC only!
+#   Adds support for GUI/video hardware acceleration, OpenGL/GLES, Vulkan and VA-API
+# - none | Default, No GPU
+# - intel
+# - nvidia
+# - amd
+# - custom | Manual driver install (DietPi will not make driver changes to your system)
+CONFIG_GPU_DRIVER=${CONFIG[GPU_DRIVER]}
+
+# System-wide proxy settings
+# - Do not modify, you must use dietpi-config > "Network Options: Adapters" to apply
+CONFIG_PROXY_ADDRESS=${CONFIG[PROXY_ADDRESS]}
+CONFIG_PROXY_PORT=${CONFIG[PROXY_PORT]}
+CONFIG_PROXY_USERNAME=${CONFIG[PROXY_USERNAME]}
+CONFIG_PROXY_PASSWORD=${CONFIG[PROXY_PASSWORD]}
+
+# Connection timeout in seconds for G_CHECK_NET and G_CHECK_URL. Increase if you have a "flaky" connection or slow DNS resolver.
+# - Set this to "0" to allow unlimited time, however this is not recommended to avoid unlimited hanging background scripts, e.g. daily DietPi update check.
+# - A negative or non-integer value will result in the default of 10 seconds.
+CONFIG_G_CHECK_URL_TIMEOUT=${CONFIG[G_CHECK_URL_TIMEOUT]}
+# Connection attempts with above timeout each, before G_CHECK_NET and G_CHECK_URL give up and prompt an error.
+# - Any value below "1" or a non-integer value will result in the default of 2 attempts.
+CONFIG_G_CHECK_URL_ATTEMPTS=${CONFIG[G_CHECK_URL_ATTEMPTS]}
+# General connection and DNS testing
+# - IPv4 address to ping when checking network connectivity. Default: 9.9.9.9 (Quad9 DNS IP)
+CONFIG_CHECK_CONNECTION_IP=${CONFIG[CHECK_CONNECTION_IP]}
+# - IPv6 address to ping when checking network connectivity. Default: 2620:fe::fe (Quad9 DNS IP)
+CONFIG_CHECK_CONNECTION_IPV6=${CONFIG[CHECK_CONNECTION_IPV6]}
+# - Domain to resolve when checking DNS resolver. Default: dietpi.com
+CONFIG_CHECK_DNS_DOMAIN=${CONFIG[CHECK_DNS_DOMAIN]}
+
+# Daily check for DietPi updates: 0=disable | 1=enable
+# - Checks are done by downloading a file of only 7 bytes.
+CONFIG_CHECK_DIETPI_UPDATES=${CONFIG[CHECK_DIETPI_UPDATES]}
+
+# Daily check for APT package updates: 0=disable | 1=check only | 2=check and upgrade automatically
+# - Upgrade logs can be found at: /var/tmp/dietpi/logs/dietpi-update_apt.log
+CONFIG_CHECK_APT_UPDATES=${CONFIG[CHECK_APT_UPDATES]}
+
+# Network time sync: 0=disabled | 1=boot only | 2=boot + daily | 3=boot + hourly | 4=Daemon + Drift
+CONFIG_NTP_MODE=${CONFIG[NTP_MODE]}
+
+# Sound card
+CONFIG_SOUNDCARD=${CONFIG[SOUNDCARD]}
+
+# LCD Panel addon
+# - Do not modify, you must use dietpi-config to configure/set options
+CONFIG_LCDPANEL=${CONFIG[LCDPANEL]}
+
+# IPv6
+CONFIG_ENABLE_IPV6=${CONFIG[ENABLE_IPV6]}
+
+# APT mirrors which are applied to /etc/apt/sources.list | Values here will also be applied during 1st run setup
+# - Raspbian: https://www.raspbian.org/RaspbianMirrors
+CONFIG_APT_RASPBIAN_MIRROR=${CONFIG[APT_RASPBIAN_MIRROR]}
+# - Debian: https://www.debian.org/mirror/official#list
+CONFIG_APT_DEBIAN_MIRROR=${CONFIG[APT_DEBIAN_MIRROR]}
+
+# NTP server(s) applied to /etc/systemd/timesyncd.conf
+# - "default": Use the NTP server(s) provided via DHCP, else the debian.pool.ntp.org NTP pool.
+# - "gateway": Use the router/gateway as NTP server. Recommended, if it does provide this functionality.
+# - To use another public NTP pool, see the full list at: https://www.ntppool.org/zone/@
+#   Use the pool domain without leading integer and dot (without "0."), like "debian.pool.ntp.org", "pool.ntp.org" or "uk.pool.ntp.org".
+# - You can also use a custom IP address, hostname or any combination of space-separated IP addresses, hostnames and NTP pool domains.
+CONFIG_NTP_MIRROR=${CONFIG[NTP_MIRROR]}
+
+EOF
+
+  # DietPi-Software settings
+  cat >> "$output_file" <<EOF
+#------------------------------------------------------------------------------------------------------
+##### DietPi-Software settings #####
+#------------------------------------------------------------------------------------------------------
+# Public domain name
+# - If you plan to make this server accessible from the Internet, you can define its (planned) public domain name here.
+# - This will be used by certain software install options as default if a public domain name is required or beneficial for it to function.
+# - Currently used by:
+#	Nextcloud Talk to configure it with Coturn
+#	Synapse as public facing server name
+#	dietpi-letsencrypt as default entry
+#SOFTWARE_PUBLIC_DOMAIN_NAME=mydomain.org
+
+# SSH Server
+# - Disable SSH password logins, e.g. when using pubkey authentication
+#	0=Allow password logins for all users, including root
+#	root=Disable password login for root user only
+#	1=Disable password logins for all users, assure that you have a valid SSH key applied!
+SOFTWARE_DISABLE_SSH_PASSWORD_LOGINS=${CONFIG[SSH_DISABLE_PASSWORD_LOGINS]}
+
+# WireGuard
+# - Whether to install WireGuard as "Server" or "Client", relevant for unattended installs only, else a menu is shown
+SOFTWARE_WIREGUARD_MODE=${CONFIG[SOFTWARE_WIREGUARD_MODE]}
+# - Listening UDP port to use when installing WireGuard in server mode, relevant for unattended installs only, else an inputbox is shown
+SOFTWARE_WIREGUARD_PORT=${CONFIG[SOFTWARE_WIREGUARD_PORT]}
+
+# VNC Server
+SOFTWARE_VNCSERVER_WIDTH=${CONFIG[SOFTWARE_VNCSERVER_WIDTH]}
+SOFTWARE_VNCSERVER_HEIGHT=${CONFIG[SOFTWARE_VNCSERVER_HEIGHT]}
+SOFTWARE_VNCSERVER_DEPTH=${CONFIG[SOFTWARE_VNCSERVER_DEPTH]}
+SOFTWARE_VNCSERVER_DISPLAY_INDEX=${CONFIG[SOFTWARE_VNCSERVER_DISPLAY_INDEX]}
+SOFTWARE_VNCSERVER_SHARE_DESKTOP=${CONFIG[SOFTWARE_VNCSERVER_SHARE_DESKTOP]}
+
+# ownCloud/Nextcloud
+# - Optional username for admin account, the default is 'admin', applied during install
+SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME=${CONFIG[SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME]}
+# - Optional data directory, default is "/mnt/dietpi_userdata/owncloud_data" respectively "/mnt/dietpi_userdata/nextcloud_data", applied during install
+SOFTWARE_OWNCLOUD_DATADIR=${CONFIG[SOFTWARE_OWNCLOUD_DATADIR]}
+SOFTWARE_NEXTCLOUD_DATADIR=${CONFIG[SOFTWARE_NEXTCLOUD_DATADIR]}
+
+# Synapse
+# - Initial admin username, relevant for unattended installs only, else an inputbox is shown
+SOFTWARE_SYNAPSE_USERNAME=${CONFIG[SOFTWARE_SYNAPSE_USERNAME]}
+
+# WiFi Hotspot
+SOFTWARE_WIFI_HOTSPOT_SSID=${CONFIG[SOFTWARE_WIFI_HOTSPOT_SSID]}
+# - Key requires a minimum of 8 characters
+SOFTWARE_WIFI_HOTSPOT_KEY=${CONFIG[SOFTWARE_WIFI_HOTSPOT_KEY]}
+# - 2.4 GHz WiFi channel, not effective if 5 GHz frequency is enabled
+SOFTWARE_WIFI_HOTSPOT_CHANNEL=${CONFIG[SOFTWARE_WIFI_HOTSPOT_CHANNEL]}
+# - 802.11n/WiFi 4, 802.11ac/WiFi 5, 802.11ax/WiFi 6 and 5 GHz support: Note that your WiFi adapter must support it!
+# - WiFi 5 support implicitly switches to 5 GHz frequency.
+# - 5 GHz frequency implicitly enables WiFi 4 support if neither WiFi 4, 5 nor 6 is enabled.
+SOFTWARE_WIFI_HOTSPOT_WIFI4=${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI4]}
+SOFTWARE_WIFI_HOTSPOT_WIFI5=${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI5]}
+# - WiFi 6 is only supported from Debian Bookworm on!
+SOFTWARE_WIFI_HOTSPOT_WIFI6=${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI6]}
+SOFTWARE_WIFI_HOTSPOT_5G=${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G]}
+# - A full list of supported 5 GHz WiFi channels per region can be found e.g. on Wikipedia: https://en.wikipedia.org/wiki/List_of_WLAN_channels#5_GHz_(802.11a/h/n/ac/ax)
+SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL=${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL]}
+
+# X11
+# - DPI 96(default) 120(+25%) 144(+50%) 168(+75%) 192(+100%)
+SOFTWARE_XORG_DPI=${CONFIG[SOFTWARE_XORG_DPI]}
+
+# Chromium
+SOFTWARE_CHROMIUM_RES_X=${CONFIG[SOFTWARE_CHROMIUM_RES_X]}
+SOFTWARE_CHROMIUM_RES_Y=${CONFIG[SOFTWARE_CHROMIUM_RES_Y]}
+SOFTWARE_CHROMIUM_AUTOSTART_URL=${CONFIG[SOFTWARE_CHROMIUM_AUTOSTART_URL]}
+
+# Home Assistant
+# - Optional Python build dependencies and modules, possibly required for certain HA components
+#	Space separated list (no quotation!), will be installed together with Home Assistant automatically, if present
+SOFTWARE_HOMEASSISTANT_APT_DEPS=${CONFIG[SOFTWARE_HOMEASSISTANT_APT_DEPS]}
+#	Add Python modules with version string at best, e.g.: firstModule==1.2.3 secondModule==4.5.6
+SOFTWARE_HOMEASSISTANT_PIP_DEPS=${CONFIG[SOFTWARE_HOMEASSISTANT_PIP_DEPS]}
+
+# K3s
+# Command with flags to use for launching K3s in the service
+# The value of this variable is copied directly into the INSTALL_K3S_EXEC environment variable before
+# running the K3s installer.
+# https://rancher.com/docs/k3s/latest/en/installation/install-options/#options-for-installation-with-script
+#
+# Optionally, you can add a configuration file named /boot/dietpi-k3s.yaml,
+# which will be copied into place during installation.
+# https://rancher.com/docs/k3s/latest/en/installation/install-options/#configuration-file
+SOFTWARE_K3S_EXEC=${CONFIG[SOFTWARE_K3S_EXEC]}
+
+# DietPi-Dashboard
+# Version to use
+# - Stable = Use release version of DietPi-Dashboard.
+# - Nightly = Use unstable version DietPi-Dashboard. Might have bugs, but will probably have more features.
+SOFTWARE_DIETPI_DASHBOARD_VERSION=${CONFIG[SOFTWARE_DIETPI_DASHBOARD_VERSION]}
+# Whether to only install backend or not
+SOFTWARE_DIETPI_DASHBOARD_BACKEND=${CONFIG[SOFTWARE_DIETPI_DASHBOARD_BACKEND]}
+
+# PiVPN
+# - For an unattended install, place a config file named "unattended_pivpn.conf" into the boot partition/directory.
+# - For example configs, have a look at: https://github.com/pivpn/pivpn/tree/master/examples
+
+# Shairport Sync
+# - Uncomment and set to "2" to install experimental AirPlay 2 build: https://github.com/mikebrady/shairport-sync/blob/master/AIRPLAY2.md
+#SOFTWARE_SHAIRPORT_SYNC_AIRPLAY=2
+
+# UrBackup Server
+# - Backup path, optional, defaults to "/mnt/dietpi_userdata/urbackup", effective on fresh UrBackup Server installs only
+SOFTWARE_URBACKUP_BACKUPPATH=${CONFIG[SOFTWARE_URBACKUP_BACKUPPATH]}
+
+# Roon Server
+# - Set to "1" to install early access builds instead of regular/stable ones: https://help.roonlabs.com/portal/en/kb/articles/roon-early-access-program
+# - Relevant for automated/unattended installs only, else a dialogue is shown to choose/switch between both.
+# - NB: Early access builds have a higher chance to contain bugs, and you may need to restore a database backup when reverting from early access to stable builds.
+SOFTWARE_ROONSERVER_EARLYACCESS=${CONFIG[SOFTWARE_ROONSERVER_EARLYACCESS]}
+
+#------------------------------------------------------------------------------------------------------
+##### Dev settings #####
+#------------------------------------------------------------------------------------------------------
+DEV_GITBRANCH=${CONFIG[DEV_GITBRANCH]}
+DEV_GITOWNER=${CONFIG[DEV_GITOWNER]}
+
+#------------------------------------------------------------------------------------------------------
+##### Settings, automatically added by dietpi-update #####
+#------------------------------------------------------------------------------------------------------
+EOF
+
+  ok "Generated: $output_file"
+}
+
+# ------------- preview & save -------------
+
+preview_config() {
+  local preview=""
+  local DIM=$'\e[2m' RST=$'\e[0m' BOLD=$'\e[1m'
+  
+  preview+="${BOLD}configuration summary${RST}\n"
+  preview+="====================\n\n"
+  
+  preview+="${BOLD}network:${RST}\n"
+  if category_selected "network"; then
+    local net_section=""
+
+    local eth_status="$([ "${CONFIG[NET_ETHERNET_ENABLED]}" -eq 1 ] && echo "enabled" || echo "disabled")"
+    [[ "${CONFIG[NET_ETHERNET_ENABLED]}" -eq 1 ]] && net_section+="  ${DIM}ethernet: $eth_status (default)${RST}\n" || net_section+="  ethernet: $eth_status\n"
+
+    local wifi_status="$([ "${CONFIG[NET_WIFI_ENABLED]}" -eq 1 ] && echo "enabled (${CONFIG[NET_WIFI_COUNTRY_CODE]})" || echo "disabled")"
+    [[ "${CONFIG[NET_WIFI_ENABLED]}" -eq 1 ]] && net_section+="  wifi: $wifi_status\n" || net_section+="  ${DIM}wifi: $wifi_status (default)${RST}\n"
+
+    local ip_config="$([ "${CONFIG[NET_USESTATIC]}" -eq 1 ] && echo "static (${CONFIG[NET_STATIC_IP]})" || echo "DHCP")"
+    if [[ "${CONFIG[NET_USESTATIC]}" -eq 0 ]]; then
+      net_section+="  ${DIM}IP: $ip_config (default)${RST}\n"
+    else
+      net_section+="  IP: $ip_config mask ${CONFIG[NET_STATIC_MASK]} gw ${CONFIG[NET_STATIC_GATEWAY]} dns ${CONFIG[NET_STATIC_DNS]}\n"
+    fi
+
+    [[ "${CONFIG[NET_HOSTNAME]}" != "DietPi" ]] && net_section+="  hostname: ${CONFIG[NET_HOSTNAME]}\n"
+
+    [[ "${CONFIG[NET_DHCP_TO_STATIC]}" -eq 1 ]] && net_section+="  dhcp->static on 1st boot: yes\n"
+    [[ "${CONFIG[NET_ETH_FORCE_SPEED]}" -ne 0 ]] && net_section+="  ethernet speed: ${CONFIG[NET_ETH_FORCE_SPEED]}\n"
+    [[ "${CONFIG[BOOT_WAIT_FOR_NETWORK]}" -eq 0 ]] && net_section+="  wait for network: no\n"
+    [[ "${CONFIG[NET_WIFI_COUNTRY_CODE]}" != "GB" ]] && net_section+="  wifi country: ${CONFIG[NET_WIFI_COUNTRY_CODE]}\n"
+
+    if [[ "${CONFIG[PROXY_ENABLED]}" -eq 1 ]]; then
+      net_section+="  proxy: ${CONFIG[PROXY_ADDRESS]}:${CONFIG[PROXY_PORT]}\n"
+      [[ -n "${CONFIG[PROXY_USERNAME]}" ]] && net_section+="    username: ${CONFIG[PROXY_USERNAME]}\n"
+    fi
+
+    [[ -z "$net_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$net_section"
+  else
+    preview+="  ${DIM}default values (not configured)${RST}\n"
+  fi
+  preview+="\n"
+  
+  preview+="${BOLD}localization:${RST}\n"
+  if category_selected "localization"; then
+    local loc_section=""
+    [[ "${CONFIG[LOCALE]}" != "C.UTF-8" ]] && loc_section+="  locale: ${CONFIG[LOCALE]}\n"
+    [[ "${CONFIG[KEYBOARD_LAYOUT]}" != "gb" ]] && loc_section+="  keyboard: ${CONFIG[KEYBOARD_LAYOUT]}\n"
+    [[ "${CONFIG[TIMEZONE]}" != "UTC" ]] && loc_section+="  timezone: ${CONFIG[TIMEZONE]}\n"
+    [[ -z "$loc_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$loc_section"
+  else
+    preview+="  ${DIM}default values (not configured)${RST}\n"
+  fi
+  preview+="\n"
+  
+  preview+="${BOLD}system:${RST}\n"
+  if category_selected "system"; then
+    local sys_section=""
+
+    [[ "${CONFIG[GLOBAL_PASSWORD]}" != "dietpi" ]] && sys_section+="  password: ***\n" || sys_section+="  ${DIM}password: *** (default)${RST}\n"
+
+    local swap_display="auto"
+    if [[ "${CONFIG[SWAPFILE_SIZE]}" -eq 0 ]]; then swap_display="disabled"; fi
+    if [[ "${CONFIG[SWAPFILE_SIZE]}" -gt 1 ]]; then swap_display="${CONFIG[SWAPFILE_SIZE]} MiB"; fi
+    [[ "${CONFIG[SWAPFILE_SIZE]}" -ne 1 ]] && sys_section+="  swap: $swap_display\n" || sys_section+="  ${DIM}swap: $swap_display (default)${RST}\n"
+
+    [[ "${CONFIG[SWAPFILE_LOCATION]}" != "/var/swap" ]] && sys_section+="  swap location: ${CONFIG[SWAPFILE_LOCATION]}\n"
+    [[ "${CONFIG[SERIAL_CONSOLE_ENABLE]}" -eq 0 ]] && sys_section+="  serial console: disabled\n"
+    [[ "${CONFIG[UNMASK_LOGIND]}" -eq 1 ]] && sys_section+="  systemd-logind: unmasked\n"
+    [[ "${CONFIG[CUSTOM_SCRIPT_EXEC]}" != "0" ]] && sys_section+="  custom script exec: ${CONFIG[CUSTOM_SCRIPT_EXEC]}\n"
+    [[ "${CONFIG[BACKUP_RESTORE]}" -ne 0 ]] && sys_section+="  backup restore: ${CONFIG[BACKUP_RESTORE]}\n"
+    [[ "${CONFIG[HEADLESS]}" -eq 1 ]] && sys_section+="  headless: yes\n"
+
+    [[ -z "$sys_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$sys_section"
+  else
+    preview+="  ${DIM}default values (not configured)${RST}\n"
+  fi
+  preview+="\n"
+  
+  preview+="${BOLD}SSH & Security:${RST}\n"
+  if category_selected "ssh"; then
+    local ssh_section=""
+    local ssh_server="Dropbear"
+    case "${CONFIG[SSH_SERVER_INDEX]}" in
+      -1) ssh_section+="  ${DIM}server: $ssh_server (default)${RST}\n";;
+      -2) ssh_server="OpenSSH"; ssh_section+="  server: $ssh_server\n";;
+      0) ssh_server="none"; ssh_section+="  server: $ssh_server\n";;
+    esac
+    
+    case "${CONFIG[SSH_DISABLE_PASSWORD_LOGINS]}" in
+      0) ssh_section+="  ${DIM}password auth: allow (default)${RST}\n";;
+      1) ssh_section+="  password auth: disabled\n";;
+      root) ssh_section+="  password auth: disabled for root\n";;
+    esac
+    
+    [[ -n "${CONFIG[SSH_PUBKEY]}" ]] && ssh_section+="  public key: ${CONFIG[SSH_PUBKEY]:0:50}...\n"
+    [[ -z "$ssh_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$ssh_section"
+  else
+    preview+="  ${DIM}default values (not configured)${RST}\n"
+  fi
+  preview+="\n"
+  
+  preview+="${BOLD}software:${RST}\n"
+  if category_selected "software"; then
+    local sw_section=""
+    [[ "${CONFIG[AUTOMATED]}" -eq 1 ]] && sw_section+="  automated install: yes\n" || sw_section+="  ${DIM}automated install: no (default)${RST}\n"
+    [[ -n "${CONFIG[INSTALL_SOFTWARE_ID]}" ]] && sw_section+="  DietPi software IDs: ${CONFIG[INSTALL_SOFTWARE_ID]}\n"
+    [[ -n "${CONFIG[APT_INSTALLS]}" ]] && sw_section+="  APT packages: ${CONFIG[APT_INSTALLS]}\n"
+
+    if [[ "${CONFIG[LOGGING_INDEX]}" -ne -1 || "${CONFIG[RAMLOG_MAXSIZE]}" -ne 50 ]]; then
+      sw_section+="  logging: mode ${CONFIG[LOGGING_INDEX]}, ramlog max ${CONFIG[RAMLOG_MAXSIZE]} MiB\n"
+    fi
+
+    if [[ ! ( "${CONFIG[WEB_SERVER_INDEX]}" -eq 0 && "${CONFIG[DESKTOP_INDEX]}" -eq 0 && "${CONFIG[BROWSER_INDEX]}" -eq -1 ) ]]; then
+      sw_section+="  prefs: web ${CONFIG[WEB_SERVER_INDEX]}, desktop ${CONFIG[DESKTOP_INDEX]}, browser ${CONFIG[BROWSER_INDEX]}\n"
+    fi
+
+    case "${CONFIG[AUTOSTART_TARGET_INDEX]}" in
+      7) sw_section+="  autostart: console with auto-login\n";;
+      2) sw_section+="  autostart: desktop with auto-login\n";;
+      16) sw_section+="  autostart: desktop (login required)\n";;
+    esac
+
+    if [[ "${CONFIG[AUTOSTART_TARGET_INDEX]}" != "0" && -n "${CONFIG[AUTOSTART_LOGIN_USER]}" && "${CONFIG[AUTOSTART_LOGIN_USER]}" != "root" ]]; then
+      sw_section+="  autologin user: ${CONFIG[AUTOSTART_LOGIN_USER]}\n"
+    fi
+
+    [[ -z "$sw_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$sw_section"
+  else
+    preview+="  ${DIM}default values (not configured)${RST}\n"
+  fi
+  preview+="\n"
+  
+  preview+="${BOLD}advanced:${RST}\n"
+  if category_selected "advanced"; then
+    local adv_section=""
+    [[ "${CONFIG[CPU_GOVERNOR]}" != "schedutil" ]] && adv_section+="  CPU governor: ${CONFIG[CPU_GOVERNOR]}\n"
+
+    case "${CONFIG[SURVEY_OPTED_IN]}" in
+      1) adv_section+="  survey: opt in\n";;
+      0) adv_section+="  survey: opt out\n";;
+    esac
+
+    [[ "${CONFIG[CHECK_DIETPI_UPDATES]}" -eq 0 ]] && adv_section+="  DietPi updates: disabled\n"
+
+    case "${CONFIG[CHECK_APT_UPDATES]}" in
+      2) adv_section+="  APT updates: check and upgrade\n";;
+      0) adv_section+="  APT updates: disabled\n";;
+    esac
+
+    case "${CONFIG[NTP_MODE]}" in
+      4) adv_section+="  NTP: daemon + drift\n";;
+      3) adv_section+="  NTP: boot + hourly\n";;
+      1) adv_section+="  NTP: boot only\n";;
+      0) adv_section+="  NTP: disabled\n";;
+    esac
+
+    [[ "${CONFIG[ENABLE_IPV6]}" -eq 0 ]] && adv_section+="  IPv6: disabled\n"
+
+    if [[ ! ( "${CONFIG[CPU_ONDEMAND_SAMPLE_RATE]}" -eq 25000 && "${CONFIG[CPU_ONDEMAND_SAMPLE_DOWNFACTOR]}" -eq 40 && "${CONFIG[CPU_USAGE_THROTTLE_UP]}" -eq 50 ) ]]; then
+      adv_section+="  CPU ondemand: rate ${CONFIG[CPU_ONDEMAND_SAMPLE_RATE]}µs downfactor ${CONFIG[CPU_ONDEMAND_SAMPLE_DOWNFACTOR]} throttle_up ${CONFIG[CPU_USAGE_THROTTLE_UP]}\n"
+    fi
+
+    if [[ ! ( "${CONFIG[CPU_MAX_FREQ]}" == "Disabled" && "${CONFIG[CPU_MIN_FREQ]}" == "Disabled" ) ]]; then
+      adv_section+="  CPU freq max/min: ${CONFIG[CPU_MAX_FREQ]} / ${CONFIG[CPU_MIN_FREQ]}\n"
+    fi
+
+    [[ "${CONFIG[CPU_DISABLE_TURBO]}" -eq 1 ]] && adv_section+="  CPU turbo: disabled\n"
+    [[ "${CONFIG[GPU_DRIVER]}" != "none" ]] && adv_section+="  GPU driver: ${CONFIG[GPU_DRIVER]}\n"
+
+    if [[ ! ( "${CONFIG[G_CHECK_URL_TIMEOUT]}" -eq 10 && "${CONFIG[G_CHECK_URL_ATTEMPTS]}" -eq 2 ) ]]; then
+      adv_section+="  conn timeout/attempts: ${CONFIG[G_CHECK_URL_TIMEOUT]}s / ${CONFIG[G_CHECK_URL_ATTEMPTS]}\n"
+    fi
+
+    if [[ ! ( "${CONFIG[CHECK_CONNECTION_IP]}" == "9.9.9.9" && "${CONFIG[CHECK_CONNECTION_IPV6]}" == "2620:fe::fe" && "${CONFIG[CHECK_DNS_DOMAIN]}" == "dietpi.com" ) ]]; then
+      adv_section+="  conn tests: v4 ${CONFIG[CHECK_CONNECTION_IP]} | v6 ${CONFIG[CHECK_CONNECTION_IPV6]} | DNS ${CONFIG[CHECK_DNS_DOMAIN]}\n"
+    fi
+
+    [[ "${CONFIG[SOUNDCARD]}" != "none" ]] && adv_section+="  sound card: ${CONFIG[SOUNDCARD]}\n"
+    [[ "${CONFIG[LCDPANEL]}" != "none" ]] && adv_section+="  LCD panel: ${CONFIG[LCDPANEL]}\n"
+
+    if [[ ! ( "${CONFIG[APT_RASPBIAN_MIRROR]}" == "http://raspbian.raspberrypi.com/raspbian" && "${CONFIG[APT_DEBIAN_MIRROR]}" == "https://deb.debian.org/debian" ) ]]; then
+      adv_section+="  apt mirrors: raspbian ${CONFIG[APT_RASPBIAN_MIRROR]} | debian ${CONFIG[APT_DEBIAN_MIRROR]}\n"
+    fi
+
+    [[ "${CONFIG[NTP_MIRROR]}" != "default" ]] && adv_section+="  NTP mirror: ${CONFIG[NTP_MIRROR]}\n"
+
+    if [[ ! ( "${CONFIG[DEV_GITBRANCH]}" == "master" && "${CONFIG[DEV_GITOWNER]}" == "MichaIng" ) ]]; then
+      adv_section+="  dev git: ${CONFIG[DEV_GITOWNER]}/${CONFIG[DEV_GITBRANCH]}\n"
+    fi
+
+    [[ -z "$adv_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$adv_section"
+  else
+    preview+="  ${DIM}default values (not configured)${RST}\n"
+  fi
+  preview+="\n"
+
+  # DietPi-Software settings overview
+  preview+="${BOLD}dietpi-software:${RST}\n"
+  local dps_section=""
+
+  [[ "${CONFIG[SSH_DISABLE_PASSWORD_LOGINS]}" != "0" ]] && dps_section+="  SSH pwd logins: ${CONFIG[SSH_DISABLE_PASSWORD_LOGINS]}\n"
+
+  if [[ ! ( "${CONFIG[SOFTWARE_WIREGUARD_MODE]}" == "Server" && "${CONFIG[SOFTWARE_WIREGUARD_PORT]}" == "51820" ) ]]; then
+    dps_section+="  WireGuard: mode ${CONFIG[SOFTWARE_WIREGUARD_MODE]} port ${CONFIG[SOFTWARE_WIREGUARD_PORT]}\n"
+  fi
+
+  if [[ ! ( "${CONFIG[SOFTWARE_VNCSERVER_WIDTH]}" == "1280" && "${CONFIG[SOFTWARE_VNCSERVER_HEIGHT]}" == "720" && "${CONFIG[SOFTWARE_VNCSERVER_DEPTH]}" == "16" && "${CONFIG[SOFTWARE_VNCSERVER_DISPLAY_INDEX]}" == "1" && "${CONFIG[SOFTWARE_VNCSERVER_SHARE_DESKTOP]}" == "0" ) ]]; then
+    dps_section+="  VNC: ${CONFIG[SOFTWARE_VNCSERVER_WIDTH]}x${CONFIG[SOFTWARE_VNCSERVER_HEIGHT]} depth ${CONFIG[SOFTWARE_VNCSERVER_DEPTH]} display ${CONFIG[SOFTWARE_VNCSERVER_DISPLAY_INDEX]} share ${CONFIG[SOFTWARE_VNCSERVER_SHARE_DESKTOP]}\n"
+  fi
+
+  if [[ ! ( "${CONFIG[SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME]}" == "admin" && "${CONFIG[SOFTWARE_OWNCLOUD_DATADIR]}" == "/mnt/dietpi_userdata/owncloud_data" && "${CONFIG[SOFTWARE_NEXTCLOUD_DATADIR]}" == "/mnt/dietpi_userdata/nextcloud_data" ) ]]; then
+    dps_section+="  ownCloud/Nextcloud: user ${CONFIG[SOFTWARE_OWNCLOUD_NEXTCLOUD_USERNAME]} data ${CONFIG[SOFTWARE_OWNCLOUD_DATADIR]} / ${CONFIG[SOFTWARE_NEXTCLOUD_DATADIR]}\n"
+  fi
+
+  [[ "${CONFIG[SOFTWARE_SYNAPSE_USERNAME]}" != "dietpi" ]] && dps_section+="  Synapse admin: ${CONFIG[SOFTWARE_SYNAPSE_USERNAME]}\n"
+
+  if [[ ! ( "${CONFIG[SOFTWARE_WIFI_HOTSPOT_SSID]}" == "DietPi-HotSpot" && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_KEY]}" == "dietpihotspot" && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_CHANNEL]}" == "3" && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G]}" -eq 0 && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI4]}" -eq 0 && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI5]}" -eq 0 && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI6]}" -eq 0 && "${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL]}" == "36" ) ]]; then
+    dps_section+="  WiFi hotspot: ssid ${CONFIG[SOFTWARE_WIFI_HOTSPOT_SSID]} key ${CONFIG[SOFTWARE_WIFI_HOTSPOT_KEY]} ch ${CONFIG[SOFTWARE_WIFI_HOTSPOT_CHANNEL]} 5G ${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G]} 5Gch ${CONFIG[SOFTWARE_WIFI_HOTSPOT_5G_CHANNEL]} wifi4 ${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI4]} wifi5 ${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI5]} wifi6 ${CONFIG[SOFTWARE_WIFI_HOTSPOT_WIFI6]}\n"
+  fi
+
+  [[ "${CONFIG[SOFTWARE_XORG_DPI]}" != "96" ]] && dps_section+="  X11 DPI: ${CONFIG[SOFTWARE_XORG_DPI]}\n"
+
+  if [[ ! ( "${CONFIG[SOFTWARE_CHROMIUM_RES_X]}" == "1280" && "${CONFIG[SOFTWARE_CHROMIUM_RES_Y]}" == "720" && "${CONFIG[SOFTWARE_CHROMIUM_AUTOSTART_URL]}" == "https://dietpi.com/" ) ]]; then
+    dps_section+="  Chromium: ${CONFIG[SOFTWARE_CHROMIUM_RES_X]}x${CONFIG[SOFTWARE_CHROMIUM_RES_Y]} url ${CONFIG[SOFTWARE_CHROMIUM_AUTOSTART_URL]}\n"
+  fi
+
+  if [[ -n "${CONFIG[SOFTWARE_HOMEASSISTANT_APT_DEPS]}" || -n "${CONFIG[SOFTWARE_HOMEASSISTANT_PIP_DEPS]}" ]]; then
+    dps_section+="  Home Assistant deps: APT '${CONFIG[SOFTWARE_HOMEASSISTANT_APT_DEPS]}' PIP '${CONFIG[SOFTWARE_HOMEASSISTANT_PIP_DEPS]}'\n"
+  fi
+
+  [[ -n "${CONFIG[SOFTWARE_K3S_EXEC]}" ]] && dps_section+="  K3s exec: ${CONFIG[SOFTWARE_K3S_EXEC]}\n"
+
+  if [[ ! ( "${CONFIG[SOFTWARE_DIETPI_DASHBOARD_VERSION]}" == "Stable" && "${CONFIG[SOFTWARE_DIETPI_DASHBOARD_BACKEND]}" -eq 0 ) ]]; then
+    dps_section+="  Dashboard: version ${CONFIG[SOFTWARE_DIETPI_DASHBOARD_VERSION]} backend ${CONFIG[SOFTWARE_DIETPI_DASHBOARD_BACKEND]}\n"
+  fi
+
+  [[ "${CONFIG[SOFTWARE_URBACKUP_BACKUPPATH]}" != "/mnt/dietpi_userdata/urbackup" ]] && dps_section+="  UrBackup path: ${CONFIG[SOFTWARE_URBACKUP_BACKUPPATH]}\n"
+  [[ "${CONFIG[SOFTWARE_ROONSERVER_EARLYACCESS]}" -ne 0 ]] && dps_section+="  Roon early access: ${CONFIG[SOFTWARE_ROONSERVER_EARLYACCESS]}\n"
+
+  [[ -z "$dps_section" ]] && preview+="  ${DIM}all defaults${RST}\n" || preview+="$dps_section"
+  preview+="\n"
+  
+  printf "%b" "$preview"
+}
+
+wizard_review() {
+  debug "wizard_review() called"
+  local preview
+  preview=$(preview_config)
+  debug "preview_config generated, length: ${#preview}"
+  
+  if [[ "$USE_DIALOG" -eq 1 ]]; then
+    # Use pager (less) for better scrolling support
+    local tmpfile
+    tmpfile=$(mktemp)
+    debug "Created temp file: $tmpfile"
+    printf "%b" "$preview" > "$tmpfile"
+    debug "Wrote preview to temp file"
+    
+    # Use less for proper scrolling with arrow keys
+    less -R -P "Configuration Review - press 'q' to continue" "$tmpfile" </dev/tty
+    debug "Less viewer exited"
+    rm -f "$tmpfile"
+    debug "Cleaned up temp file"
+  else
+    printf "\n%s\n" "${BOLD}configuration review${RST}"
+    printf "%s\n" "$preview"
+    printf "\n"
+    read -rp "press Enter to continue..." || true
+  fi
+}
+
+# ------------- CLI -------------
+
+usage() {
+  cat <<EOF
+${BOLD}dietpi-txt-wizard${RST} v${VERSION}
+
+${BOLD}what this does${RST}
+  interactive wizard to create dietpi.txt configuration files for DietPi automation.
+
+${BOLD}usage${RST}
+  dietpi-txt-wizard [options]
+
+${BOLD}options${RST}
+  -o, --output <file>
+      output file path (default: ./dietpi.txt)
+
+  -i, --input <file>
+      start from existing dietpi.txt as template (loads current values)
+
+  -h, --help
+      show this help
+
+${BOLD}examples${RST}
+  1) run the wizard interactively
+     dietpi-txt-wizard
+
+  2) save to a specific file
+     dietpi-txt-wizard --output ./my-dietpi.txt
+
+  3) edit an existing dietpi.txt
+     dietpi-txt-wizard --input ./dietpi.txt --output ./dietpi-modified.txt
+
+${BOLD}about${RST}
+  this wizard helps you create dietpi.txt files for DietPi's automated first-boot
+  installation feature. configure network, localization, software, and more without
+  manual editing of configuration files.
+
+  for more information:
+    https://dietpi.com/docs/usage/#how-to-do-an-automatic-base-installation-at-first-boot-dietpi-automation
+
+${BOLD}notes${RST}
+  • WiFi credentials are configured in dietpi-wifi.txt (separate file)
+  • custom scripts go in Automation_Custom_Script.sh (separate file)
+  • generated files are compatible with dietpi-baker for image preparation
+EOF
+}
+
+OUTPUT_FILE="./dietpi.txt"
+INPUT_FILE=""
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output)
+        OUTPUT_FILE="${2:-}"; shift 2;;
+      -i|--input)
+        INPUT_FILE="${2:-}"; shift 2;;
+      -h|--help)
+        usage; exit 0;;
+      --)
+        shift; break;;
+      -*)
+        die "unknown option: $1";;
+      *)
+        die "unexpected argument: $1";;
+    esac
+  done
+}
+
+main() {
+  # Reset debug log on every run
+  > "$DEBUG_LOG"
+  debug "=== WIZARD START ==="
+  
+  parse_args "$@"
+  debug "Arguments parsed"
+  
+  banner
+  init_dialog
+  debug "Dialog initialized with: USE_DIALOG=$USE_DIALOG, DIALOG_CMD=$DIALOG_CMD"
+  init_config
+  debug "Config initialized"
+  
+  # load from input file if provided
+  if [[ -n "$INPUT_FILE" ]]; then
+    if [[ ! -f "$INPUT_FILE" ]]; then
+      die "input file not found: $INPUT_FILE"
+    fi
+    info "loading configuration from: $INPUT_FILE"
+    # TODO: parse existing dietpi.txt and load values into CONFIG
+    # for now, just note that we're starting from defaults
+    warn "input file parsing not yet implemented - using defaults"
+  fi
+  
+  # welcome
+  wizard_intro
+  
+  # select categories
+  local categories
+  categories=$(wizard_select_categories)
+  
+  # Check if user aborted
+  if [[ "$categories" == "__ABORT__" ]] || [[ $ABORT_CONFIRMED -eq 1 ]]; then
+    warn "wizard aborted by user"
+    exit 0
+  fi
+
+  SELECTED_CATEGORIES="$categories"
+  debug "Selected categories: $categories"
+  
+  # run wizards for selected categories
+  while IFS= read -r category; do
+    debug "Running wizard for category: $category"
+    case "$category" in
+      network) wizard_network;;
+      localization) wizard_localization;;
+      system) wizard_system;;
+      ssh) wizard_ssh;;
+      software) wizard_software;;
+      advanced) wizard_advanced;;
+    esac
+  done <<< "$categories"
+  
+  # review
+  wizard_review
+  
+  # confirm
+  if ! yesno "save configuration" \
+"save the configuration to:
+  $OUTPUT_FILE
+
+continue?"; then
+    warn "cancelled by user"
+    exit 0
+  fi
+  
+  # generate
+  log "generating dietpi.txt..."
+  generate_dietpi_txt "$OUTPUT_FILE"
+  
+  # success
+  printf "\n"
+  ok "configuration saved to: ${BOLD}$OUTPUT_FILE${RST}"
+  printf "\n"
+  info "next steps:"
+  printf "  1. review the file: cat %s\n" "$OUTPUT_FILE"
+  
+  if [[ "${CONFIG[NET_WIFI_ENABLED]}" -eq 1 ]]; then
+    printf "  2. configure WiFi in dietpi-wifi.txt\n"
+    printf "  3. use dietpi-baker to apply to an image\n"
+  else
+    printf "  2. use dietpi-baker to apply to an image\n"
+  fi
+  
+  printf "\n"
+  info "example: sudo dietpi-baker DietPi.img --config $OUTPUT_FILE --out ./output/"
+  printf "\n"
+}
+
+main "$@"
