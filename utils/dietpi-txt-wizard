@@ -2545,6 +2545,64 @@ parse_args() {
   done
 }
 
+# load existing dietpi.txt values into CONFIG
+load_input_file() {
+  local file="$1"
+  local line key value config_key loaded=0 skipped=0
+
+  debug "loading input file: $file"
+  # Be tolerant inside parser: avoid exiting on benign failures
+  set +e
+
+  # shellcheck disable=SC2162
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # trim CR and leading whitespace
+    line="${line%%$'\r'}"
+    line="${line#${line%%[![:space:]]*}}"
+
+    # skip comments/empty lines or malformed entries
+    [[ -z "$line" || ${line:0:1} == "#" || "$line" != *"="* ]] && continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    debug "read line key='$key'"
+
+    # trim simple leading/trailing spaces around key/value
+    # key: remove all internal spaces (keys are expected to be identifiers without spaces)
+    key="${key//[[:space:]]/}"
+    # value: trim leading spaces only (keep inner spaces)
+    while [[ "$value" == " "* ]]; do value="${value# }"; done
+
+    config_key="$key"
+    debug "initial config_key='$config_key' value='$value'"
+
+    # direct match first
+    if [[ ${CONFIG[$config_key]+_} ]]; then
+      CONFIG[$config_key]="$value"; ((loaded++)); continue
+    fi
+
+    # handle common prefixes
+    case "$key" in
+      AUTO_SETUP_*) config_key="${key#AUTO_SETUP_}" ;;
+      AUTO_*) config_key="${key#AUTO_}" ;;
+      CONFIG_*) config_key="${key#CONFIG_}" ;;
+      SOFTWARE_DISABLE_SSH_PASSWORD_LOGINS) config_key="SSH_DISABLE_PASSWORD_LOGINS" ;;
+      *) config_key="" ;;
+    esac
+    debug "mapped config_key='$config_key'"
+
+    if [[ -n "$config_key" && ${CONFIG[$config_key]+_} ]]; then
+      CONFIG[$config_key]="$value"; ((loaded++))
+    else
+      ((skipped++))
+      debug "input file: skipping unknown key '$key'"
+    fi
+  done < "$file"
+
+  set -e
+  debug "input file load complete: loaded=$loaded skipped=$skipped"
+}
+
 main() {
   # Reset debug log on every run
   > "$DEBUG_LOG"
@@ -2565,9 +2623,8 @@ main() {
       die "input file not found: $INPUT_FILE"
     fi
     info "loading configuration from: $INPUT_FILE"
-    # TODO: parse existing dietpi.txt and load values into CONFIG
-    # for now, just note that we're starting from defaults
-    warn "input file parsing not yet implemented - using defaults"
+    load_input_file "$INPUT_FILE"
+    ok "loaded settings from input file"
   fi
   
   # welcome
