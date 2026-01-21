@@ -12,16 +12,26 @@ chmod 600 /home/dani/.ssh/authorized_keys
 
 # disable all login methods for root (password and ssh key)
 rm /root/.ssh/authorized_keys
+rm -rf /root/.ssh
 passwd -l root
 
-# ssh: disable root access, enforce ssh key login globally (no password)
+# disable all login methods for dietpi (password and ssh key)
+rm /home/dietpi/.ssh/authorized_keys
+rm -rf /home/dietpi/.ssh
+passwd -l dietpi
+
+# ssh: disable root access, enforce ssh key login globally (no password), and whitelist ssh access to user dani only
 mkdir -p /etc/ssh
+groupadd -f sshusers
+usermod -aG sshusers dani
 cat >> /etc/ssh/sshd_config << EOF
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
 KbdInteractiveAuthentication no
+AllowGroups sshusers
 EOF
+echo 'DROPBEAR_EXTRA_ARGS="-s -G sshusers"' >> /etc/default/dropbear
 
 # silence login messages for root and dani
 touch /root/.hushlogin
@@ -56,6 +66,17 @@ echo 'set -gx VISUAL vim' >> /home/dani/.config/fish/config.fish
 echo 'export EDITOR=vim' >> /home/dani/.bashrc
 echo 'export VISUAL=vim' >> /home/dani/.bashrc
 
+# login reminder to change temporary password, self-destructs when password is changed
+echo "# BEGIN TEMPORARY PASSWORD REMINDER BLOCK
+if test \"\$(whoami)\" = \"dani\"
+  if echo \"replace_me!\" | sudo -S true dani >/dev/null 2>&1
+    echo \"!!! Please change your temporary password using the command: passwd !!!\"
+  else
+    awk 'BEGIN {in_block=0} /# BEGIN TEMPORARY PASSWORD REMINDER BLOCK/ {in_block=1; next} /# END TEMPORARY PASSWORD REMINDER BLOCK/ {in_block=0; next} !in_block {print}' /home/dani/.config/fish/config.fish > /tmp/config.fish.tmp && mv /tmp/config.fish.tmp /home/dani/.config/fish/config.fish
+  end
+end
+# END TEMPORARY PASSWORD REMINDER BLOCK" >> /home/dani/.config/fish/config.fish
+
 # TODO
 # - set up nginx
 # - set up certbot + nginx
@@ -65,5 +86,6 @@ echo 'export VISUAL=vim' >> /home/dani/.bashrc
 # - set up docker-compose n stuff with automatic container updates, config updates, etc
 # ^ webhook + git for this?
 # - set up ddns
-# - set up vpn/wireguard?
 
+# reboot to make sure all changes take effect
+reboot
