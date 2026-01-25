@@ -16,7 +16,7 @@ set -euo pipefail
 # curl -fsSL h-utils.dio.la | bash -s -- -h
 
 # load options
-curl -fsSL h.dio.la/options.sh | source
+. <(curl -fsSL h.dio.la/options.sh)
 
 TARGET_DIR="/usr/local/bin"
 MANIFEST_FILE="${TARGET_DIR}/h-scripts-installed.txt"

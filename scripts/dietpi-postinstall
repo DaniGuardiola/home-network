@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # load options
-curl -fsSL h.dio.la/options.sh | source
+. <(curl -fsSL h.dio.la/options.sh)
 
 # create main user as sudoer with temporary password
 useradd -m -s $(which fish) -G sudo "$MAIN_DIETPI_USER"
