@@ -1,29 +1,31 @@
 #!/usr/bin/env bash
-# create user dani as sudoer with temporary password
-useradd -m -s $(which fish) -G sudo dani
-echo "dani:replace_me!" | chpasswd
 
-# copy root ssh public key to dani
-mkdir -p /home/dani/.ssh
-cp /root/.ssh/authorized_keys /home/dani/.ssh/authorized_keys
-chown -R dani:dani /home/dani/.ssh
-chmod 700 /home/dani/.ssh
-chmod 600 /home/dani/.ssh/authorized_keys
+# load options
+curl -fsSL h.dio.la/options.sh | source
+
+# create main user as sudoer with temporary password
+useradd -m -s $(which fish) -G sudo "$MAIN_DIETPI_USER"
+echo "$MAIN_DIETPI_USER:replace_me!" | chpasswd
+
+# copy root ssh public key to main user
+mkdir -p "/home/$MAIN_DIETPI_USER/.ssh"
+cp /root/.ssh/authorized_keys "/home/$MAIN_DIETPI_USER/.ssh/authorized_keys"
+chown -R "$MAIN_DIETPI_USER:$MAIN_DIETPI_USER" "/home/$MAIN_DIETPI_USER/.ssh"
+chmod 700 "/home/$MAIN_DIETPI_USER/.ssh"
+chmod 600 "/home/$MAIN_DIETPI_USER/.ssh/authorized_keys"
 
 # disable all login methods for root (password and ssh key)
-rm /root/.ssh/authorized_keys
 rm -rf /root/.ssh
 passwd -l root
 
 # disable all login methods for dietpi (password and ssh key)
-rm /home/dietpi/.ssh/authorized_keys
 rm -rf /home/dietpi/.ssh
 passwd -l dietpi
 
-# ssh: disable root access, enforce ssh key login globally (no password), and whitelist ssh access to user dani only
+# ssh: disable root access, enforce ssh key login globally (no password), and whitelist ssh access to main user only
 mkdir -p /etc/ssh
 groupadd -f sshusers
-usermod -aG sshusers dani
+usermod -aG sshusers "$MAIN_DIETPI_USER"
 cat >> /etc/ssh/sshd_config << EOF
 PermitRootLogin no
 PasswordAuthentication no
@@ -33,49 +35,49 @@ AllowGroups sshusers
 EOF
 echo 'DROPBEAR_EXTRA_ARGS="-s -G sshusers"' >> /etc/default/dropbear
 
-# silence login messages for root and dani
+# silence login messages for root and main user
 touch /root/.hushlogin
-touch /home/dani/.hushlogin
-chown dani:dani /home/dani/.hushlogin
+touch "/home/$MAIN_DIETPI_USER/.hushlogin"
+chown "$MAIN_DIETPI_USER:$MAIN_DIETPI_USER" "/home/$MAIN_DIETPI_USER/.hushlogin"
 
-# set fish as default shell for root and dani
+# set fish as default shell for root and main user
 chsh -s $(which fish)
-chsh -s $(which fish) dani
+chsh -s $(which fish) "$MAIN_DIETPI_USER"
 
-# install and set up starship for root and dani in fish and bash
+# install and set up starship for root and main user in fish and bash
 curl -sS https://starship.rs/install.sh | sh -s -- -y
 echo 'starship init fish | source' >> /root/.config/fish/config.fish
 echo 'eval "$(starship init bash)"' >> /root/.bashrc
-mkdir -p /home/dani/.config/fish
-echo 'starship init fish | source' >> /home/dani/.config/fish/config.fish
-echo 'eval "$(starship init bash)"' >> /home/dani/.bashrc
+mkdir -p "/home/$MAIN_DIETPI_USER/.config/fish"
+echo 'starship init fish | source' >> "/home/$MAIN_DIETPI_USER/.config/fish/config.fish"
+echo 'eval "$(starship init bash)"' >> "/home/$MAIN_DIETPI_USER/.bashrc"
 
-# add ll alias for fish and bash for root and dani
+# add ll alias for fish and bash for root and main user
 echo "alias ll='ls -alh --color=auto'" >> /root/.config/fish/config.fish
 echo "alias ll='ls -alh --color=auto'" >> /root/.bashrc
-echo "alias ll='ls -alh --color=auto'" >> /home/dani/.config/fish/config.fish
-echo "alias ll='ls -alh --color=auto'" >> /home/dani/.bashrc
+echo "alias ll='ls -alh --color=auto'" >> "/home/$MAIN_DIETPI_USER/.config/fish/config.fish"
+echo "alias ll='ls -alh --color=auto'" >> "/home/$MAIN_DIETPI_USER/.bashrc"
 
-# set default editor to vim for root and dani
+# set default editor to vim for root and main user
 echo 'set -gx EDITOR vim' >> /root/.config/fish/config.fish
 echo 'set -gx VISUAL vim' >> /root/.config/fish/config.fish
 echo 'export EDITOR=vim' >> /root/.bashrc
 echo 'export VISUAL=vim' >> /root/.bashrc
-echo 'set -gx EDITOR vim' >> /home/dani/.config/fish/config.fish
-echo 'set -gx VISUAL vim' >> /home/dani/.config/fish/config.fish
-echo 'export EDITOR=vim' >> /home/dani/.bashrc
-echo 'export VISUAL=vim' >> /home/dani/.bashrc
+echo 'set -gx EDITOR vim' >> "/home/$MAIN_DIETPI_USER/.config/fish/config.fish"
+echo 'set -gx VISUAL vim' >> "/home/$MAIN_DIETPI_USER/.config/fish/config.fish"
+echo 'export EDITOR=vim' >> "/home/$MAIN_DIETPI_USER/.bashrc"
+echo 'export VISUAL=vim' >> "/home/$MAIN_DIETPI_USER/.bashrc"
 
 # login reminder to change temporary password, self-destructs when password is changed
 echo "# BEGIN TEMPORARY PASSWORD REMINDER BLOCK
-if test \"\$(whoami)\" = \"dani\"
-  if echo \"replace_me!\" | sudo -S true dani >/dev/null 2>&1
+if test \"$(whoami)\" = \"$MAIN_DIETPI_USER\"
+  if echo \"replace_me!\" | sudo -S true $MAIN_DIETPI_USER >/dev/null 2>&1
     echo \"!!! Please change your temporary password using the command: passwd !!!\"
   else
-    awk 'BEGIN {in_block=0} /# BEGIN TEMPORARY PASSWORD REMINDER BLOCK/ {in_block=1; next} /# END TEMPORARY PASSWORD REMINDER BLOCK/ {in_block=0; next} !in_block {print}' /home/dani/.config/fish/config.fish > /tmp/config.fish.tmp && mv /tmp/config.fish.tmp /home/dani/.config/fish/config.fish
+    awk 'BEGIN {in_block=0} /# BEGIN TEMPORARY PASSWORD REMINDER BLOCK/ {in_block=1; next} /# END TEMPORARY PASSWORD REMINDER BLOCK/ {in_block=0; next} !in_block {print}' \"/home/$MAIN_DIETPI_USER/.config/fish/config.fish\" > /tmp/config.fish.tmp && mv /tmp/config.fish.tmp \"/home/$MAIN_DIETPI_USER/.config/fish/config.fish\"
   end
 end
-# END TEMPORARY PASSWORD REMINDER BLOCK" >> /home/dani/.config/fish/config.fish
+# END TEMPORARY PASSWORD REMINDER BLOCK" >> "/home/$MAIN_DIETPI_USER/.config/fish/config.fish"
 
 # TODO
 # - set up nginx
