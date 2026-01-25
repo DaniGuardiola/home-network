@@ -15,7 +15,9 @@ set -euo pipefail
 # view help:
 # curl -fsSL h-utils.dio.la | bash -s -- -h
 
-REPO_URL="https://github.com/DaniGuardiola/home-network.git"
+# load options
+curl -fsSL h.dio.la/options.sh | source
+
 TARGET_DIR="/usr/local/bin"
 MANIFEST_FILE="${TARGET_DIR}/h-scripts-installed.txt"
 
@@ -113,7 +115,7 @@ do_install() {
 	trap cleanup EXIT
 
 	bold "cloning repository to ${TMPDIR}..."
-	git clone --depth 1 "${REPO_URL}" "${TMPDIR}" >/dev/null 2>&1 || {
+	git clone --depth 1 "${REMOTE_REPO_HTTP_URL}" "${TMPDIR}" >/dev/null 2>&1 || {
 		err "failed to clone repository. ensure you have network access and try again."
 		exit 1
 	}
