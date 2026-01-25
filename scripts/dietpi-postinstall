@@ -80,9 +80,7 @@ end
 # END TEMPORARY PASSWORD REMINDER BLOCK" >> "/home/$MAIN_DIETPI_USER/.config/fish/config.fish"
 
 # TODO
-# - set up nginx
-# - set up certbot + nginx
-# - set up reverse proxies
+# - set up caddy reverse proxy with https
 # - set up ufw rules
 # - set up backups
 # - set up docker-compose n stuff with automatic container updates, config updates, etc
